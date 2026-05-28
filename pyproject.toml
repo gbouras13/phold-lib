@@ -1,0 +1,50 @@
+[build-system]
+build-backend = "setuptools.build_meta"
+requires = ["setuptools>=61.0", "wheel>=0.37.1"]
+
+[project]
+name = "pholdlib"
+version = "0.1.0"
+description = "Shared ProstT5 inference library for phold and baktfold"
+readme = "README.md"
+requires-python = ">=3.8, <4"
+license = {file = "MIT"}
+authors = [
+    {name = "George Bouras", email = "george.bouras@adelaide.edu.au"}
+]
+
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "License :: OSI Approved :: MIT License",
+    "Natural Language :: English",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+]
+
+dependencies = [
+    "loguru >=0.5.3",
+    "requests >=2.25",
+    "sentencepiece >=0.1.99",
+    "protobuf >=3.20",
+    "transformers >=4.34",
+    "torch >=2.1.2",
+    "numpy >=1.20,<2",
+    "h5py >=3.5",
+    "tqdm >=4.35.0",
+    "alive-progress >=3.0.1",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/gbouras13/phold-lib"
+
+[project.optional-dependencies]
+lint = ["isort", "black"]
+test = ["pytest>=6.2.5", "pytest-cov >=3.0.0"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

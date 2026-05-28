@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ matrix.python-version }}-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-${{ matrix.python-version }}-
+            ${{ runner.os }}-pip-
+
+      # Install the CPU-only PyTorch wheel first so the full ~2 GB CUDA wheel
+      # is never downloaded on CI.  The package installer sees torch is already
+      # satisfied and skips it.
+      - name: Install PyTorch (CPU-only)
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install pholdlib + test dependencies
+        run: pip install -e ".[test]"
+
+      # Unit tests run without --run_integration so no model download is needed.
+      # The conftest mocks transformers if it can't be fully imported, keeping
+      # the CNN / toCPU tests green even without a working scipy install.
+      - name: Run unit tests
+        run: pytest tests/ -v --tb=short
