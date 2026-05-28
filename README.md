@@ -4,6 +4,23 @@ Shared ProstT5 inference library for [phold](https://github.com/gbouras13/phold)
 
 pholdlib provides the common pLM Foldseek 3Di inference layer — this includes loading the ProstT5 protein language model & running the CNN prediction head and writing 3Di outputs and probabilities — so that this logic is consistent and not duplicated.
 
+## Citation
+
+If you use pholdlib in your research, please cite:
+
+
+> Bouras G., Grigson S.R., Mirdita M., Heinzinger M., Papudeshi B.,  
+> Mallawaarachchi V., Green R., Kim S.R., Mihalia V., Psaltis A.J.,  
+> Wormald P-J., Vreugde S., Steinegger M., Edwards R.A.  
+>  
+> *Protein Structure Informed Bacteriophage Genome Annotation with Phold*  
+> **Nucleic Acids Research**, Volume 54, Issue 1, 13 January 2026  
+> https://doi.org/10.1093/nar/gkaf1448
+
+## License
+
+MIT
+
 ## Installation
 
 ```bash
@@ -150,12 +167,3 @@ Unit tests load module files directly via `importlib` to avoid triggering the `t
 
 Integration tests are gated behind `--run_integration`. When no `--checkpoint` is supplied they use a randomly initialised CNN predictor — predictions are meaningless but shapes, types, and probability ranges are all verified. Pass `--checkpoint` to run against the real trained weights.
 
-## Citation
-
-pholdlib is part of the phold project.  If you use it in your research, please cite:
-
-> Bouras G et al. *Systematic functional annotation of phage proteins using structural homology.* ...
-
-## License
-
-MIT
