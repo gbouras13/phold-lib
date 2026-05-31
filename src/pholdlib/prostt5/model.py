@@ -47,6 +47,7 @@ def get_T5_model(
     threads: int,
     check_fn: Optional[Callable] = None,
     zenodo_fn: Optional[Callable] = None,
+    device: Optional[str] = None,
 ) -> Tuple[T5EncoderModel, T5Tokenizer, torch.device]:
     """
     Load a ProstT5 encoder and tokenizer, downloading if necessary.
@@ -62,32 +63,43 @@ def get_T5_model(
         zenodo_fn: Optional callable(model_dir, logdir, threads) that downloads
                    the model from a Zenodo backup. Called when the HuggingFace
                    download fails. Provided by the calling tool.
+        device: Optional torch device string (e.g. ``"cuda:1"``). When set,
+                bypasses the auto-detection chain and forces the model onto
+                this device — used by the multi-GPU dispatcher to put one
+                model copy per GPU. ``cpu`` overrides ``device`` when True.
 
     Returns:
         (model, vocab, device) — the device is returned explicitly so callers
-        never need a module-level global (important for future multi-GPU support).
+        never need a module-level global.
     """
     torch.set_num_threads(threads)
 
     if cpu:
-        device = torch.device("cpu")
+        torch_device = torch.device("cpu")
         dev_name = "cpu"
+    elif device is not None:
+        # Caller has already resolved which device to use (multi-GPU path).
+        torch_device = torch.device(device)
+        dev_name = device
     else:
         if torch.cuda.is_available():
-            device = torch.device("cuda:0")
+            torch_device = torch.device("cuda:0")
             dev_name = "cuda:0"
         elif torch.backends.mps.is_available():
-            device = torch.device("mps")
+            torch_device = torch.device("mps")
             dev_name = "mps"
         elif torch.xpu.is_available():
             # Intel XPU (Data Center GPU / Arc) support — PR #129
-            device = torch.device("xpu:0")
+            torch_device = torch.device("xpu:0")
             dev_name = "xpu:0"
         else:
-            device = torch.device("cpu")
+            torch_device = torch.device("cpu")
             dev_name = "cpu"
             logger.warning("No available GPU found, but --cpu was not specified")
             logger.warning("ProstT5 will be run with CPU only")
+
+    # Rebind for the rest of the function (existing code uses `device`).
+    device = torch_device
 
     logger.info(f"Using device: {dev_name}")
     Path(model_dir).mkdir(parents=True, exist_ok=True)
