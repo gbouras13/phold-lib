@@ -16,20 +16,6 @@ from torch import nn
 from transformers import T5EncoderModel, T5Tokenizer, logging, utils
 
 
-def _accelerate_available() -> bool:
-    """Whether HuggingFace ``accelerate`` is importable.
-
-    ``accelerate`` is a hard dependency of pholdlib, but check at runtime
-    so a broken/incomplete install degrades gracefully rather than crashing
-    at import time.
-    """
-    try:
-        import accelerate  # noqa: F401
-        return True
-    except ImportError:
-        return False
-
-
 class CNN(nn.Module):
     """Two-layer convolutional prediction head used on top of ProstT5 embeddings."""
 
@@ -132,64 +118,32 @@ def get_T5_model(
     logging.set_verbosity_error()
     utils.logging.disable_progress_bar()
 
-    # ── pick a load path ────────────────────────────────────────────────────
-    # Two known-good strategies, each with different trade-offs:
-    #
-    #   FAST PATH  (preferred): pass ``device_map=str(device)`` to
-    #   ``from_pretrained``. Requires the ``accelerate`` library. Loads
-    #   weights directly onto the target device via mmap'd safetensors —
-    #   no CPU intermediate, no meta-tensor materialisation issue. ~30 s
-    #   for ProstT5 on a GPU.
-    #
-    #   SLOW PATH  (fallback): pass ``low_cpu_mem_usage=False`` and call
-    #   ``.to(device)`` after. Works without accelerate and on every
-    #   transformers version, but allocates the full model in CPU RAM as
-    #   fp32 first then copies to the device. Can take ~10 min for ProstT5
-    #   on a network filesystem.
-    #
-    # ``accelerate`` is a hard dependency of pholdlib but the check is at
-    # runtime so a broken install degrades to "slow but correct" instead
-    # of crashing.
-    use_fast_path = device.type == "cuda" and _accelerate_available()
-    if use_fast_path:
-        load_kwargs = dict(
-            cache_dir=f"{model_dir}/",
-            force_download=need_download,
-            local_files_only=localfile,
-            device_map=str(device),
-        )
-    else:
-        if device.type == "cuda":
-            logger.warning(
-                "accelerate is not installed; falling back to the slow ProstT5 "
-                "load path (~10 min instead of ~30 s on GPU). Install with "
-                "`pip install accelerate` to restore fast loading."
-            )
-        load_kwargs = dict(
-            cache_dir=f"{model_dir}/",
-            force_download=need_download,
-            local_files_only=localfile,
-            low_cpu_mem_usage=False,
-        )
-
-    def _do_load(extra: dict) -> T5EncoderModel:
-        kwargs = {**load_kwargs, **extra}
-        m = T5EncoderModel.from_pretrained(model_name, **kwargs)
-        # device_map already places the model on the target device, so .to()
-        # is unnecessary (and slightly wasteful) in the fast path.
-        if not use_fast_path:
-            m = m.to(device)
-        return m
-
+    # Plain ``from_pretrained(...).to(device)``. The "meta-tensor cannot
+    # copy out" failure we saw on pholdLATEST + multi-GPU was *not* caused
+    # by this path; it was caused by HuggingFace's loader being non-
+    # thread-safe when two workers called from_pretrained concurrently.
+    # That race is now fixed at the source — ``run_prostt5_inference_multi_gpu``
+    # loads all N models sequentially on the main thread before spawning
+    # workers — so we can use the simple, fast path here.
     try:
-        model = _do_load({})
+        model = T5EncoderModel.from_pretrained(
+            model_name,
+            cache_dir=f"{model_dir}/",
+            force_download=need_download,
+            local_files_only=localfile,
+        ).to(device)
 
     except Exception as e:
         if need_download and zenodo_fn is not None:
             logger.warning("Hugging Face download failed. Trying Zenodo backup.")
             logdir = Path(model_dir) / "logdir"
             zenodo_fn(model_dir, logdir, threads)
-            model = _do_load({"force_download": False, "local_files_only": True})
+            model = T5EncoderModel.from_pretrained(
+                model_name,
+                cache_dir=f"{model_dir}/",
+                force_download=False,
+                local_files_only=True,
+            ).to(device)
         else:
             raise RuntimeError(f"ProstT5 model loading failed: {e}") from e
 

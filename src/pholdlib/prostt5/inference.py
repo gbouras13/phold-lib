@@ -391,4 +391,21 @@ def run_prostt5_inference_multi_gpu(
     finally:
         pbar.close()
 
+    # ── completeness check ─────────────────────────────────────────────────
+    # Every input seq_id must either appear in merged_preds (success) or
+    # merged_fails (logged failure). A silent drop — neither in preds nor
+    # in fails — would cause downstream code to mask the CDS as "XXXX…"
+    # without telling the user why. Cheap insurance against future bugs
+    # in the per-batch error-handling continues.
+    input_ids = {sid for sid, _, _ in seq_dict}
+    accounted = set(merged_preds) | set(merged_fails)
+    dropped = input_ids - accounted
+    if dropped:
+        sample = sorted(dropped)[:10]
+        raise RuntimeError(
+            f"Multi-GPU inference dropped {len(dropped)} sequence(s) without "
+            f"recording them in fail_ids — likely a bug in batch error "
+            f"handling. First few: {sample}"
+        )
+
     return merged_preds, merged_emb_res, merged_emb_prot, merged_fails

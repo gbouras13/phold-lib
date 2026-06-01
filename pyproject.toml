@@ -30,12 +30,6 @@ dependencies = [
     "protobuf >=3.20",
     "transformers >=4.34",
     "torch >=2.1.2",
-    # Required by transformers ≥ ~4.40 for the modern (device_map=) loading
-    # path. Without it, from_pretrained falls back to a legacy CPU-fp32 path
-    # that takes ~10 min for ProstT5 on network filesystems instead of ~30 s
-    # via direct-to-device mmap'd loading. Also avoids the meta-tensor race
-    # on concurrent multi-GPU loads.
-    "accelerate >=0.26",
     "numpy >=2.0",
     "h5py >=3.5",
     "tqdm >=4.35.0",
