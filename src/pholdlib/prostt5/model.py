@@ -124,48 +124,38 @@ def get_T5_model(
     # populate them lazily. A subsequent ``.to(device)`` then raises
     # ``NotImplementedError: Cannot copy out of meta tensor; no data!``
     # This bites the multi-GPU path especially (two ThreadPoolExecutor
-    # workers each call from_pretrained → .to(...) concurrently). The fix:
-    #   - CUDA: pass ``device_map=str(device)`` so weights load straight
-    #     onto the target GPU and the .to() call is unnecessary (more
-    #     efficient too — no CPU intermediate).
-    #   - MPS / XPU / CPU: ``device_map`` support there is patchy across
-    #     transformers versions; fall back to ``low_cpu_mem_usage=False``
-    #     which forces eager (non-meta) weight allocation on CPU so the
-    #     ``.to(device)`` still works.
-    if device.type == "cuda":
-        from_pretrained_kwargs = dict(
-            cache_dir=f"{model_dir}/",
-            force_download=need_download,
-            local_files_only=localfile,
-            device_map=str(device),   # load directly onto cuda:i
-        )
-        needs_to_call = False
-    else:
-        from_pretrained_kwargs = dict(
-            cache_dir=f"{model_dir}/",
-            force_download=need_download,
-            local_files_only=localfile,
-            low_cpu_mem_usage=False,  # force real (non-meta) tensors
-        )
-        needs_to_call = True
-
+    # workers each call from_pretrained → .to(...) concurrently, on the
+    # same target device pattern).
+    #
+    # ``low_cpu_mem_usage=False`` forces transformers to allocate real
+    # (non-meta) tensors on CPU during loading; the subsequent
+    # ``.to(device)`` then works as before. This is universal: works on
+    # CUDA / MPS / XPU / CPU, on every transformers version, and does NOT
+    # require the optional ``accelerate`` dependency (unlike the
+    # ``device_map=`` route, which raises ValueError without accelerate).
+    # Cost: brief 1× model-size CPU RAM allocation per worker during
+    # loading (~1.2 GB fp16 for ProstT5) — negligible on a GPU node.
     try:
-        model = T5EncoderModel.from_pretrained(model_name, **from_pretrained_kwargs)
-        if needs_to_call:
-            model = model.to(device)
+        model = T5EncoderModel.from_pretrained(
+            model_name,
+            cache_dir=f"{model_dir}/",
+            force_download=need_download,
+            local_files_only=localfile,
+            low_cpu_mem_usage=False,
+        ).to(device)
 
     except Exception as e:
         if need_download and zenodo_fn is not None:
             logger.warning("Hugging Face download failed. Trying Zenodo backup.")
             logdir = Path(model_dir) / "logdir"
             zenodo_fn(model_dir, logdir, threads)
-            # Retry kwargs always go to local files; force_download=False.
-            retry_kwargs = dict(from_pretrained_kwargs)
-            retry_kwargs["force_download"] = False
-            retry_kwargs["local_files_only"] = True
-            model = T5EncoderModel.from_pretrained(model_name, **retry_kwargs)
-            if needs_to_call:
-                model = model.to(device)
+            model = T5EncoderModel.from_pretrained(
+                model_name,
+                cache_dir=f"{model_dir}/",
+                force_download=False,
+                local_files_only=True,
+                low_cpu_mem_usage=False,
+            ).to(device)
         else:
             raise RuntimeError(f"ProstT5 model loading failed: {e}") from e
 
