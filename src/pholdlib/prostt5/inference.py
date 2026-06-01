@@ -310,6 +310,34 @@ def run_prostt5_inference_multi_gpu(
         f"{[len(s) for s in shards]} (round-robin after global length-sort)."
     )
 
+    # ── Load all N models sequentially on the main thread BEFORE spawning
+    #    workers. HuggingFace's from_pretrained() is not thread-safe:
+    #    concurrent loads of the same checkpoint race on shared internal
+    #    state and the second thread receives a model whose parameters
+    #    live on the `meta` device (shape-only placeholders, no data).
+    #    The subsequent .to(device) then raises
+    #    ``NotImplementedError: Cannot copy out of meta tensor``.
+    #    Cost: model loads are serialised (~N × single-load wall-clock,
+    #    e.g. 30 s × 2 = 60 s) but inference (~tens of minutes) is still
+    #    fully parallel, so the multi-GPU speedup is preserved.
+    logger.info(f"Loading {n_devices} model instances (sequential, main thread)…")
+    loaded: List[Tuple[str, object, object, object, torch.device]] = []
+    for dev in devices:
+        is_cpu = dev == "cpu"
+        model, vocab, torch_device = get_T5_model(
+            model_dir, model_name,
+            cpu=is_cpu,
+            threads=threads,
+            check_fn=check_fn,
+            zenodo_fn=zenodo_fn,
+            device=None if is_cpu else dev,
+        )
+        predictor = load_predictor(checkpoint_path, torch_device)
+        if half_precision and not is_cpu:
+            model = model.half()
+            predictor = predictor.half()
+        loaded.append((dev, model, vocab, predictor, torch_device))
+
     # Single shared progress bar driven by every worker.
     progress_lock = threading.Lock()
     pbar = tqdm(total=len(seq_dict), desc=desc)
@@ -318,23 +346,12 @@ def run_prostt5_inference_multi_gpu(
         with progress_lock:
             pbar.update(n)
 
-    def _worker(device_str: str, shard: List[Tuple[str, str, int]]):
-        """Load model on `device_str` and run inference on `shard`."""
-        is_cpu = device_str == "cpu"
-        model, vocab, torch_device = get_T5_model(
-            model_dir, model_name,
-            cpu=is_cpu,
-            threads=threads,
-            check_fn=check_fn,
-            zenodo_fn=zenodo_fn,
-            device=None if is_cpu else device_str,
-        )
-        predictor = load_predictor(checkpoint_path, torch_device)
+    def _worker(dev, model, vocab, predictor, torch_device, shard):
+        """Run inference on `shard` using the pre-loaded model on `dev`.
 
-        if half_precision and not is_cpu:
-            model = model.half()
-            predictor = predictor.half()
-
+        No model loading here — the model is already materialised on the
+        target device. This thread only does forward passes.
+        """
         return run_prostt5_inference(
             shard,
             model, vocab, predictor, torch_device,
@@ -344,7 +361,7 @@ def run_prostt5_inference_multi_gpu(
             output_probs=output_probs,
             save_per_residue_embeddings=save_per_residue_embeddings,
             save_per_protein_embeddings=save_per_protein_embeddings,
-            desc=f"{desc} [{device_str}]",
+            desc=f"{desc} [{dev}]",
             progress_callback=_on_batch,
         )
 
@@ -356,8 +373,8 @@ def run_prostt5_inference_multi_gpu(
     try:
         with ThreadPoolExecutor(max_workers=n_devices) as pool:
             futures = {
-                pool.submit(_worker, dev, shard): dev
-                for dev, shard in zip(devices, shards)
+                pool.submit(_worker, dev, model, vocab, predictor, torch_device, shard): dev
+                for (dev, model, vocab, predictor, torch_device), shard in zip(loaded, shards)
                 if shard  # skip empty shards (rare: len(seq_dict) < n_devices)
             }
             for fut in as_completed(futures):
