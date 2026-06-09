@@ -4,7 +4,7 @@ requires = ["setuptools>=61.0", "wheel>=0.37.1"]
 
 [project]
 name = "pholdlib"
-version = "0.1.0"
+version = "0.1.1"
 description = "Shared ProstT5 inference library for phold and baktfold"
 readme = "README.md"
 requires-python = ">=3.8, <4"
@@ -30,7 +30,15 @@ dependencies = [
     "protobuf >=3.20",
     "transformers >=4.34",
     "torch >=2.1.2",
-    "numpy >=2.0",
+    # Loosened from `>=2.0` to `>=1.24` so consumer projects (phold,
+    # baktfold) installed in environments with Debian-managed numpy
+    # 1.26.x (e.g. the pawsey/pytorch ROCm Docker base image) don't
+    # trigger pip's "Cannot uninstall numpy: RECORD file not found"
+    # error. pholdlib only uses the stable numeric API; the only
+    # numpy-2.x divergence (np.float32 vs Python float on round) is
+    # explicitly neutralised by the `float(...)` cast in
+    # prostt5/inference.py.
+    "numpy >=1.24",
     "h5py >=3.5",
     "tqdm >=4.35.0",
     "alive-progress >=3.0.1",
