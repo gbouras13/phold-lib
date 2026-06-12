@@ -21,22 +21,18 @@ SS_MAPPING = {
 
 
 def mask_low_confidence_aa(sequence: str, scores, threshold: float = 0.5) -> str:
-    """
-    Replace amino acids whose ProstT5 confidence score is below threshold with 'X'.
+    """Replace amino acids whose ProstT5 confidence score is below *threshold* with 'X'.
 
-    Args:
-        sequence: Amino acid sequence string.
-        scores: Iterable of per-residue confidence scores (0–1).
-                Accepts either a flat iterable or a single-element list wrapping one.
-        threshold: Confidence cutoff (default 0.5).
-
-    Returns:
-        Modified sequence with low-confidence residues replaced by 'X'.
+    *scores* is a numpy array of shape (1, L) or (L,), or an equivalent nested list.
+    Uses a numpy byte-mask — O(L) with no per-residue Python loop or float() call.
     """
-    return "".join(
-        "X" if float(score) < threshold else aa
-        for aa, score in zip(sequence, *scores)
-    )
+    score_arr = np.asarray(scores, dtype=np.float64).ravel()
+    mask = score_arr < threshold
+    if not mask.any():
+        return sequence
+    buf = np.frombuffer(bytearray(sequence, "ascii"), dtype=np.uint8).copy()
+    buf[mask] = 88  # ord("X")
+    return buf.tobytes().decode("ascii")
 
 
 def write_probs(
