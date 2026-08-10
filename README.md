@@ -1,8 +1,11 @@
 # pholdlib
 
-Shared ProstT5 inference library for [phold](https://github.com/gbouras13/phold) and [baktfold](https://github.com/gbouras13/baktfold).
+Shared protein-language-model inference library for [phold](https://github.com/gbouras13/phold) and [baktfold](https://github.com/gbouras13/baktfold).
 
-pholdlib provides the common pLM Foldseek 3Di inference layer — this includes loading the ProstT5 protein language model & running the CNN prediction head and writing 3Di outputs and probabilities — so that this logic is consistent and not duplicated.
+pholdlib provides the common pLM → Foldseek layer so that this logic is consistent and not duplicated. It supports two backends:
+
+- **ProstT5** (`pholdlib.prostt5`) — the ProstT5 encoder plus a CNN prediction head, emitting Foldseek 3Di.
+- **ModernProst** (`pholdlib.modernprost`) — a single ModernBERT-style encoder emitting Foldseek **3Di and a 12-state secondary-structure alphabet** in one forward pass, plus the Foldseek query-database construction for both (combined `_ss` sequence DBs and 3Di/12-state profile DBs).
 
 ## Citation
 
@@ -124,6 +127,99 @@ Key batching parameters:
 | `check_prostT5_download(model_dir, model_name, md5_dict, model_subdir)` | Returns `True` if the model is absent or corrupt and needs to be (re)downloaded. |
 | `download_zenodo_prostT5(model_dir, logdir, threads, backup_url, backup_md5, backup_tarball)` | Download and extract a ProstT5 tarball from a Zenodo backup URL. |
 
+## ModernProst (3Di + 12-state)
+
+ModernProst maps an amino-acid sequence directly to Foldseek's 3Di alphabet **and** a 12-state secondary-structure alphabet in a single forward pass — no ProstT5 encoder, no separate CNN head. Four checkpoints are published:
+
+| Model | Size | Default task | Query DB built |
+|---|---|---|---|
+| `modernprost-base` | ~1.0 B | `classification` | combined `_ss` |
+| `modernprost-50M` | ~53 M | `classification` | combined `_ss` |
+| `modernprost-pssm` | ~1.0 B | `pssm` | `_profile_ss` / `_profile_ss12` / `_profile` |
+| `modernprost-50M-pssm` | ~53 M | `pssm` | `_profile_ss` / `_profile_ss12` / `_profile` |
+
+The `-pssm` checkpoints are trained to emit calibrated per-residue distributions, which are written straight into Foldseek profile databases rather than being collapsed to an argmax letter.
+
+Requires `transformers >= 5.0` (the checkpoints are HuggingFace `custom_code` models loaded with `trust_remote_code=True`; tested against 5.9.0). The ProstT5 backend still works on older `transformers`.
+
+```python
+from pathlib import Path
+
+from pholdlib.modernprost import (
+    get_modernprost_model, run_modernprost_inference,
+    write_3di_fasta, write_12st_fasta, generate_combined_foldseek_db,
+    subprocess_tsv2db_runner,
+)
+
+model, tokenizer, device = get_modernprost_model(
+    model_dir=Path("/path/to/model_cache"),
+    model_name="modernprost-50M",
+    cpu=False, threads=4, half_precision=True,
+)
+
+seqs = [("protein_A", "MKTIIALSYIFCLVFA", 16)]   # sorted descending by length
+result = run_modernprost_inference(seqs, model, tokenizer, device, task="classification")
+
+keys = [s[0] for s in seqs]
+# NOTE mask_threshold must stay 0 when the FASTA feeds a combined 3Di+12st DB.
+write_3di_fasta(result.predictions_3di, "3di.fasta", keys, mask_threshold=0)
+write_12st_fasta(result.predictions_12st, "12st.fasta", keys)
+
+generate_combined_foldseek_db(
+    "aa.fasta", "3di.fasta", "12st.fasta",
+    foldseek_db_path="foldseek_db", db_name="query",
+    tsv2db_runner=subprocess_tsv2db_runner("foldseek"),
+)
+```
+
+### `pholdlib.modernprost.model` / `.inference`
+
+| Function | Description |
+|---|---|
+| `get_modernprost_model(model_dir, model_name, cpu, threads, check_fn, zenodo_fn, device, half_precision)` | Load a ModernProst model + tokenizer. Returns `(model, tokenizer, device)`. |
+| `run_modernprost_inference(seq_dict, model, tokenizer, device, task=..., chunk_len=1568, ...)` | Batch inference. Returns a `ModernProstResult`. |
+| `run_modernprost_inference_multi_gpu(seq_dict, devices, model_dir, model_name, ...)` | Shard across GPUs round-robin and merge. Loads all model copies sequentially first (HuggingFace's loader is not thread-safe). |
+
+`ModernProstResult` fields:
+
+- `predictions_3di` / `predictions_12st` — `{seq_id: (pred, mean_prob, all_prob)}`, `classification` task only.
+- `profiles_3di` / `profiles_12st` — `{seq_id: ndarray (L, 20 | 12)}` softmax profiles, `pssm` task only.
+- `embeddings_per_residue` / `embeddings_per_protein`, `fail_ids`.
+
+Sequences longer than `chunk_len` are split into near-equal chunks, inferred independently, and stitched back together; the reported mean confidence is recomputed over the full-length sequence.
+
+### `pholdlib.modernprost.output`
+
+| Function / Constant | Description |
+|---|---|
+| `THREEDI_ALPHABET` / `SS12_ALPHABET` | `"ACDEFGHIKLMNPQRSTVWY"` and `"ACDEFGHIKLMN"`. |
+| `write_3di_fasta(...)` / `write_12st_fasta(...)` | FASTA writers. Only the 3Di writer takes a `mask_threshold`. |
+| `write_mean_probs(...)` / `write_all_probs(...)` | Mean-confidence CSV and per-residue JSONL. |
+| `write_profiles_text(profiles, out_path, alphabet, original_keys)` | Human-readable profile blocks (`pssm` task). |
+
+### `pholdlib.modernprost.foldseek_db` / `.profile_db`
+
+| Function | Description |
+|---|---|
+| `generate_combined_foldseek_db(fasta_aa, fasta_3di, fasta_12st, foldseek_db_path, db_name, tsv2db_runner)` | Build the combined 3Di+12st query DB. |
+| `generate_sequence_foldseek_db(aa_sequences, foldseek_db_path, db_name, tsv2db_runner)` | Build a plain AA DB + lookup, used as the source for profile DBs. |
+| `write_profile_foldseek_dbs(profiles_3di, profiles_12st, aa_sequences, lookup, output_dir, db_name, source_db)` | Build `_profile_ss`, `_profile_ss12` and `_profile`. |
+| `encode_combined(seq_3di, seq_12st)` | Pack one residue pair per byte: `c = 3di_index * 12 + ss12_index`. |
+
+Search a combined or profile DB with `--ss-12st 1`; profile DBs additionally want `--sort-by-structure-bits 0`.
+
+**Masking caveat.** The combined encoding has no 21st 3Di state, so a masked `X` cannot be represented — `encode_combined` rejects it with an actionable error. Write the 3Di FASTA with `mask_threshold=0` and apply confidence masking to the amino-acid FASTA instead.
+
+### `pholdlib.databases.modernprost`
+
+| Function / Constant | Description |
+|---|---|
+| `MODERNPROST_MODELS` | Registry of the four published checkpoints. |
+| `resolve_modernprost_model(name)` | Look up by short name or full HuggingFace id. |
+| `is_modernprost_model(name)` / `default_task_for(name)` | Branch between backends; get a checkpoint's trained task. |
+| `check_modernprost_download(model_dir, model_name, md5_dict)` | `True` when the model needs (re)downloading. Falls back to a snapshot completeness check when no MD5 dict is registered. |
+| `download_zenodo_modernprost(...)` | Zenodo backup download + extract. |
+
 ## Notes for downstream tools
 
 - **`check_fn` / `zenodo_fn` hooks** — `get_T5_model` accepts optional callables for model integrity checking and Zenodo fallback download. Tool-specific implementations (e.g. phold's `check_prostT5_download`) are passed in; pholdlib ships the base `Rostlab/ProstT5_fp16` MD5 dict and a generic `download_zenodo_prostT5` that callers configure with their own backup URL.
@@ -162,6 +258,11 @@ pytest tests/ --run_integration --gpu_available --threads 8
 | `tests/test_databases.py` | MD5 dict structure, `_calc_md5`, `check_prostT5_download`, `download_zenodo_prostT5` |
 | `tests/test_model.py` | `CNN` forward pass and architecture, `toCPU`, `load_predictor` |
 | `tests/test_integration.py` | Model loading, tokenizer, predictor, batch inference, per-residue/protein embeddings, output round-trip |
+| `tests/test_modernprost_output.py` | 3Di/12-state alphabets, FASTA + probability + profile-text writers, masking |
+| `tests/test_modernprost_db.py` | Combined 3Di+12st byte packing, `_ss` patch-by-index, PSSM maths, profile-DB record layout |
+| `tests/test_modernprost_registry.py` | Model registry resolution, snapshot integrity check, chunking and chunk-id helpers |
+
+The ModernProst database tests stub `foldseek tsv2db` with a pure-Python equivalent, so the whole unit suite still runs with no external binary.
 
 Unit tests load module files directly via `importlib` to avoid triggering the `transformers` import chain in `pholdlib/prostt5/__init__.py`, so they run without a working HuggingFace / scipy install. `conftest.py` also mocks `transformers` automatically if it cannot be imported, keeping the PyTorch-only `CNN` and `toCPU` tests green in broken environments.
 
