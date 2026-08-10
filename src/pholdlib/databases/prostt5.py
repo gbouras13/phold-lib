@@ -11,6 +11,7 @@ should define their own MD5 dicts and pass them via the md5_dict argument.
 """
 
 import hashlib
+import sys
 import tarfile
 from pathlib import Path
 from typing import Dict, Optional
@@ -123,7 +124,7 @@ def download_zenodo_prostT5(
     logger.info(f"Extracting ProstT5 model backup: {tarball_path} -> {model_dir}")
     try:
         with tarball_path.open("rb") as fh_in, tarfile.open(fileobj=fh_in, mode="r:gz") as tar:
-            tar.extractall(path=str(model_dir))
+            _safe_extractall(tar, model_dir)
     except OSError as exc:
         logger.warning(f"Encountered OSError: {exc}")
         logger.error(f"Could not extract {tarball_path} to {model_dir}")
@@ -134,6 +135,61 @@ def download_zenodo_prostT5(
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+def _safe_extractall(tar: tarfile.TarFile, dest: Path) -> None:
+    """Extract ``tar`` into ``dest`` with path-traversal protection.
+
+    Plain ``TarFile.extractall`` honours member names like ``../../etc/passwd``,
+    so a corrupted or tampered-with tarball can write outside ``dest``. The
+    mitigation is version-dependent:
+
+    * **Python 3.12+**: delegate to CPython's ``filter="data"``, which strips
+      leading separators from absolute names, rejects ``..`` escapes, blocks
+      links whose targets leave the destination, and disallows special file
+      modes. It becomes the default in 3.14; requesting it explicitly also
+      silences the 3.12/3.13 DeprecationWarning.
+    * **Python 3.8-3.11**: the equivalent checks by hand — resolve each
+      member (and link target) under ``dest`` and reject anything outside.
+
+    Note that the two branches differ on *absolute* member names: the data
+    filter strips the leading separator and extracts to ``dest/etc/passwd``,
+    whereas the manual branch rejects the member outright. Both keep the
+    write inside ``dest``, which is the property that matters.
+
+    Raises:
+        tarfile.TarError: if a member or link target escapes ``dest``.
+
+    See https://docs.python.org/3.12/library/tarfile.html#extraction-filters
+    and PEP 706 for the full filter contract.
+    """
+    dest = Path(dest).resolve()
+
+    if sys.version_info >= (3, 12):
+        tar.extractall(path=str(dest), filter="data")
+        return
+
+    for member in tar.getmembers():
+        member_dest = (dest / member.name).resolve()
+        try:
+            member_dest.relative_to(dest)
+        except ValueError:
+            raise tarfile.TarError(
+                f"Refusing to extract '{member.name}' from tarball: "
+                f"resolved path {member_dest} escapes destination {dest}"
+            )
+        if member.issym() or member.islnk():
+            link_target = (member_dest.parent / member.linkname).resolve()
+            try:
+                link_target.relative_to(dest)
+            except ValueError:
+                raise tarfile.TarError(
+                    f"Refusing to extract link '{member.name}' -> "
+                    f"'{member.linkname}' from tarball: target {link_target} "
+                    f"escapes destination {dest}"
+                )
+
+    tar.extractall(path=str(dest))
+
 
 def _calc_md5(file_path: Path, buffer_size: int = 1024 * 1024) -> str:
     """Return the MD5 hex digest of file_path."""
