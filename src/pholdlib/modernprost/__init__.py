@@ -2,94 +2,91 @@
 
 See :mod:`pholdlib.databases.modernprost` for the model registry and
 :mod:`pholdlib.modernprost.inference` for the inference engine.
+
+Imports here are **lazy** (PEP 562). ``model`` and ``inference`` pull in
+``transformers`` and ``torch``, which cost seconds on a local disk and can cost
+minutes on a shared cluster filesystem. Importing them eagerly would make every
+consumer pay that price merely to reach the database builders in
+``foldseek_db`` / ``profile_db``, which need nothing heavier than numpy — and,
+worse, would charge it to unrelated commands: ``from
+pholdlib.modernprost.foldseek_db import ...`` executes this module first, so an
+eager import chain here reaches anything that touches Foldseek DB construction,
+including a bare ``--help``.
+
+``from pholdlib.modernprost import get_modernprost_model`` still works and still
+imports torch — it just does so at first attribute access rather than at package
+import. Submodules can also be imported directly
+(``from pholdlib.modernprost.output import write_3di_fasta``) to bypass this
+module's ``__getattr__`` entirely.
 """
 
-from pholdlib.modernprost.model import count_parameters, get_modernprost_model
-from pholdlib.modernprost.inference import (
-    DEFAULT_CHUNK_LEN,
-    ModernProstResult,
-    chunk_sequence,
-    predictions_from_profiles,
-    run_modernprost_inference,
-    run_modernprost_inference_multi_gpu,
-)
-from pholdlib.modernprost.output import (
-    SS12_ALPHABET,
-    SS12_MAPPING,
-    THREEDI_ALPHABET,
-    THREEDI_MAPPING,
-    THREEDI_MASK_INDEX,
-    decode_12st,
-    decode_3di,
-    format_profile,
-    write_12st_fasta,
-    write_3di_fasta,
-    write_all_probs,
-    write_fail_ids,
-    write_mean_probs,
-    write_profiles_text,
-)
-from pholdlib.modernprost.foldseek_db import (
-    DBTYPE_SS_12ST,
-    build_lookup,
-    encode_combined,
-    generate_combined_foldseek_db,
-    generate_sequence_foldseek_db,
-    read_fasta,
-    sort_index_file,
-    subprocess_tsv2db_runner,
-)
-from pholdlib.modernprost.profile_db import (
-    AA_ALPHABET,
-    aa_profile_record,
-    compute_log_pssm_12st,
-    compute_log_pssm_3di,
-    parse_profiles,
-    to_profile_record,
-    write_profile_foldseek_dbs,
-)
+from importlib import import_module
+from typing import Any
 
-__all__ = [
-    # model
-    "get_modernprost_model",
-    "count_parameters",
-    # inference
-    "run_modernprost_inference",
-    "run_modernprost_inference_multi_gpu",
-    "ModernProstResult",
-    "chunk_sequence",
-    "predictions_from_profiles",
-    "DEFAULT_CHUNK_LEN",
-    # output
-    "THREEDI_ALPHABET",
-    "SS12_ALPHABET",
-    "THREEDI_MAPPING",
-    "SS12_MAPPING",
-    "THREEDI_MASK_INDEX",
-    "decode_3di",
-    "decode_12st",
-    "format_profile",
-    "write_3di_fasta",
-    "write_12st_fasta",
-    "write_mean_probs",
-    "write_all_probs",
-    "write_fail_ids",
-    "write_profiles_text",
-    # foldseek dbs
-    "generate_combined_foldseek_db",
-    "generate_sequence_foldseek_db",
-    "encode_combined",
-    "read_fasta",
-    "build_lookup",
-    "sort_index_file",
-    "subprocess_tsv2db_runner",
-    "DBTYPE_SS_12ST",
-    # profile dbs
-    "write_profile_foldseek_dbs",
-    "compute_log_pssm_3di",
-    "compute_log_pssm_12st",
-    "to_profile_record",
-    "aa_profile_record",
-    "parse_profiles",
-    "AA_ALPHABET",
-]
+# Public name -> submodule that defines it. Kept as data so __getattr__ stays a
+# dict lookup and __dir__ needs no separate list to drift out of sync.
+_EXPORTS = {
+    # model (imports transformers)
+    "get_modernprost_model": "model",
+    "count_parameters": "model",
+    # inference (imports torch)
+    "run_modernprost_inference": "inference",
+    "run_modernprost_inference_multi_gpu": "inference",
+    "ModernProstResult": "inference",
+    "chunk_sequence": "inference",
+    "predictions_from_profiles": "inference",
+    "DEFAULT_CHUNK_LEN": "inference",
+    # output (numpy only)
+    "THREEDI_ALPHABET": "output",
+    "SS12_ALPHABET": "output",
+    "THREEDI_MAPPING": "output",
+    "SS12_MAPPING": "output",
+    "THREEDI_MASK_INDEX": "output",
+    "decode_3di": "output",
+    "decode_12st": "output",
+    "format_profile": "output",
+    "write_3di_fasta": "output",
+    "write_12st_fasta": "output",
+    "write_mean_probs": "output",
+    "write_all_probs": "output",
+    "write_fail_ids": "output",
+    "write_profiles_text": "output",
+    # foldseek dbs (numpy only)
+    "generate_combined_foldseek_db": "foldseek_db",
+    "generate_sequence_foldseek_db": "foldseek_db",
+    "encode_combined": "foldseek_db",
+    "read_fasta": "foldseek_db",
+    "build_lookup": "foldseek_db",
+    "sort_index_file": "foldseek_db",
+    "subprocess_tsv2db_runner": "foldseek_db",
+    "DBTYPE_SS_12ST": "foldseek_db",
+    # profile dbs (numpy only)
+    "write_profile_foldseek_dbs": "profile_db",
+    "compute_log_pssm_3di": "profile_db",
+    "compute_log_pssm_12st": "profile_db",
+    "to_profile_record": "profile_db",
+    "aa_profile_record": "profile_db",
+    "parse_profiles": "profile_db",
+    "AA_ALPHABET": "profile_db",
+}
+
+__all__ = list(_EXPORTS)
+
+
+def __getattr__(name: str) -> Any:
+    """Resolve a public name by importing its submodule on first access."""
+    try:
+        submodule = _EXPORTS[name]
+    except KeyError:
+        raise AttributeError(
+            f"module {__name__!r} has no attribute {name!r}"
+        ) from None
+
+    value = getattr(import_module(f"{__name__}.{submodule}"), name)
+    # Cache on the module so subsequent lookups skip __getattr__ entirely.
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list:
+    return sorted(set(globals()) | set(_EXPORTS))
