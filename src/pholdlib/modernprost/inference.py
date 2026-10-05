@@ -233,6 +233,7 @@ def run_modernprost_inference(
     _log_chunking(items, chunk_len)
     device = torch.device(device)
     chosen, mode = _choose_engine(engine, compile, device, model, items.n_tokens)
+    pack_tokens = _fit_pack_tokens(items, chosen, pack_tokens)
     store = _OutputStore(items, task, save_per_residue_embeddings or save_per_protein_embeddings,
                          hidden_size=int(model.config.hidden_size))
     batches = _plan(items, chosen, max_residues, pad_multiple, max_batch, pack_tokens)
@@ -331,6 +332,7 @@ def run_modernprost_inference_multi_gpu(
     _log_chunking(items, chunk_len)
     model0, device0 = loaded[0]
     chosen, mode = _choose_engine(engine, compile, device0, model0, items.n_tokens)
+    pack_tokens = _fit_pack_tokens(items, chosen, pack_tokens)
     store = _OutputStore(items, task, save_per_residue_embeddings or save_per_protein_embeddings,
                          hidden_size=int(model0.config.hidden_size))
     batches = _plan(items, chosen, max_residues, pad_multiple, max_batch, pack_tokens)
@@ -494,6 +496,21 @@ def _choose_engine(engine: str, compile: str, device: torch.device, model,
             f"with torch.compile ({mode}); the first batch compiles, then it runs faster."
         )
     return engine, mode
+
+
+def _fit_pack_tokens(items: TokenisedItems, engine: str, pack_tokens: int) -> int:
+    """Packed rows must hold the longest item; grow them (to a multiple of
+    the FlexAttention tile) when ``chunk_len`` exceeds ``pack_tokens``."""
+    if engine != "packed" or not items.n_items:
+        return pack_tokens
+    from pholdlib.modernprost.packed import DEFAULT_BLOCK
+
+    longest = int(items.lengths.max())
+    if longest <= pack_tokens:
+        return pack_tokens
+    fitted = -(-longest // DEFAULT_BLOCK) * DEFAULT_BLOCK
+    logger.info(f"Longest item is {longest} residues; packing {fitted} tokens per row instead of {pack_tokens}.")
+    return fitted
 
 
 def _plan(items: TokenisedItems, engine: str, max_residues: int, pad_multiple: int,

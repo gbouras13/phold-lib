@@ -120,6 +120,15 @@ class TestChooseEngine:
         assert not ok
 
 
+class TestFitPackTokens:
+    def test_grows_rows_for_long_chunks(self):
+        seqs = [("long", "A" * 5000, 5000), ("short", "M" * 10, 10)]
+        items = batching.TokenisedItems.from_sequences(seqs, LUT, chunk_len=10 ** 6)
+        assert inference._fit_pack_tokens(items, "packed", 4096) == 5120
+        assert inference._fit_pack_tokens(items, "packed", 65536) == 65536
+        assert inference._fit_pack_tokens(items, "padded", 4096) == 4096
+
+
 # ===========================================================================
 # Output assembly
 # ===========================================================================
