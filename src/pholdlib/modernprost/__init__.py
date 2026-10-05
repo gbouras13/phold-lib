@@ -36,6 +36,19 @@ _EXPORTS = {
     "chunk_sequence": "inference",
     "predictions_from_profiles": "inference",
     "DEFAULT_CHUNK_LEN": "inference",
+    "DEFAULT_TOKEN_BUDGET": "inference",
+    "DEFAULT_PACK_TOKENS": "inference",
+    "PACKED_MIN_RESIDUES": "inference",
+    "packed_min_residues": "inference",
+    "ENGINES": "inference",
+    # packed engine (imports torch)
+    "PackedEncoder": "packed",
+    "packed_engine_status": "packed",
+    # batching (numpy only)
+    "TokenisedItems": "batching",
+    "build_token_lut": "batching",
+    "plan_padded_batches": "batching",
+    "plan_packed_batches": "batching",
     # output (numpy only)
     "THREEDI_ALPHABET": "output",
     "SS12_ALPHABET": "output",

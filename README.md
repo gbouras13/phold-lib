@@ -140,7 +140,7 @@ ModernProst maps an amino-acid sequence directly to Foldseek's 3Di alphabet **an
 
 The `-pssm` checkpoints are trained to emit calibrated per-residue distributions, which are written straight into Foldseek profile databases rather than being collapsed to an argmax letter.
 
-Requires `transformers >= 5.0` (the checkpoints are HuggingFace `custom_code` models loaded with `trust_remote_code=True`; tested against 5.9.0). The ProstT5 backend still works on older `transformers`.
+Requires `transformers >= 4.51` (the checkpoints are HuggingFace `custom_code` models loaded with `trust_remote_code=True`; tested with 5.9, 5.15 and 5.17). Older releases load the classification checkpoints but not the `-pssm` ones, whose config import sits in a `try/except` that the pre-4.51 import scanner misreads as a missing PyPI package. The ProstT5 backend still works on older `transformers`.
 
 ```python
 from pathlib import Path
@@ -157,7 +157,7 @@ model, tokenizer, device = get_modernprost_model(
     cpu=False, threads=4, half_precision=True,
 )
 
-seqs = [("protein_A", "MKTIIALSYIFCLVFA", 16)]   # sorted descending by length
+seqs = [("protein_A", "MKTIIALSYIFCLVFA", 16)]   # (id, sequence, length), any order
 result = run_modernprost_inference(seqs, model, tokenizer, device, task="classification")
 
 keys = [s[0] for s in seqs]
@@ -177,8 +177,8 @@ generate_combined_foldseek_db(
 | Function | Description |
 |---|---|
 | `get_modernprost_model(model_dir, model_name, cpu, threads, check_fn, zenodo_fn, device, half_precision)` | Load a ModernProst model + tokenizer. Returns `(model, tokenizer, device)`. |
-| `run_modernprost_inference(seq_dict, model, tokenizer, device, task=..., chunk_len=1568, ...)` | Batch inference. Returns a `ModernProstResult`. |
-| `run_modernprost_inference_multi_gpu(seq_dict, devices, model_dir, model_name, ...)` | Shard across GPUs round-robin and merge. Loads all model copies sequentially first (HuggingFace's loader is not thread-safe). |
+| `run_modernprost_inference(seq_dict, model, tokenizer, device, task=..., engine="auto", compile="auto", max_residues=65536, ...)` | Batch inference with one loaded model. Returns a `ModernProstResult`. |
+| `run_modernprost_inference_multi_gpu(seq_dict, devices, model_dir, model_name, ...)` | Loads one model per device (sequentially: HuggingFace's loader is not thread-safe), then one worker thread per device pulls batches from a shared queue into one set of output buffers. |
 
 `ModernProstResult` fields:
 
@@ -186,7 +186,31 @@ generate_combined_foldseek_db(
 - `profiles_3di` / `profiles_12st` — `{seq_id: ndarray (L, 20 | 12)}` softmax profiles, `pssm` task only.
 - `embeddings_per_residue` / `embeddings_per_protein`, `fail_ids`.
 
-Sequences longer than `chunk_len` are split into near-equal chunks, inferred independently, and stitched back together; the reported mean confidence is recomputed over the full-length sequence.
+Sequences longer than `chunk_len` are split into near-equal chunks, inferred independently, and stitched back together; the reported mean confidence is recomputed over the full-length sequence. Returned arrays are views into per-run buffers: copy one before modifying it in place.
+
+#### Inference engines
+
+The input is tokenised once (a 256-entry lookup table built from the tokenizer's vocabulary) and run through one of two engines. Both reduce the logits on the GPU, copy back only real tokens, and overlap host-side bookkeeping with the next batch.
+
+| engine | how | where |
+|---|---|---|
+| `padded` | one protein per row, longest first, rows padded to a multiple of 8; a batch is bounded by *computed* tokens (`rows x padded length <= max_residues`) | any device; the checkpoint's own forward |
+| `packed` | proteins concatenated into rows of `pack_tokens` (65,536) tokens; per-protein RoPE positions; FlexAttention block masks keep each protein to itself and give the sliding-window layers their real O(L x window) cost; compiled once | CUDA or ROCm GPU, torch >= 2.5, Triton |
+
+`engine="auto"` with `compile="auto"` picks, for inputs of at least 20M residues (5M for the ~1B checkpoints, whose per-residue savings repay compiling sooner): `packed` + `torch.compile` on NVIDIA GPUs, `padded` + `torch.compile(dynamic=True)` on AMD/ROCm GPUs (FlexAttention's Triton kernels are slow on MI250X), and the eager `padded` engine for smaller inputs and on CPU/MPS. Set the threshold with `PHOLDLIB_PACKED_MIN_RESIDUES`, or choose explicitly (`engine="padded"|"packed"`, `compile="on"|"off"`).
+
+Single-GPU throughput, ModernProst-50M, 111,158 phage proteins (24.7M residues):
+
+| setup | A100-40GB | MI250X GCD |
+|---|---|---|
+| pholdlib 0.2 (`max_batch=20`) | 139k residues/s | 108k residues/s |
+| `padded`, eager | 298k | 205k |
+| `padded`, compiled | 510k | 344k |
+| `packed`, compiled | 623k | 293k |
+
+Compiling costs ~30-60 s on the first batch (cold cache). Keep compile caches between runs with `TORCHINDUCTOR_CACHE_DIR` / `TRITON_CACHE_DIR`, on node-local disk on clusters (never on Lustre).
+
+`torch.compile` needs Triton's JIT toolchain. The pip wheels bundle it. conda-forge's Triton instead finds `ptxas` through the *activated* env and builds small launcher modules with the system gcc against `cuda.h`, which an env holding only the CUDA runtime does not have: add the CUDA headers (e.g. conda-forge `cuda-driver-dev`) or point `CPATH` at a CUDA toolkit's `include/`. If compiling fails for any reason, that device falls back to the eager `padded` engine with a warning instead of failing the run.
 
 ### `pholdlib.modernprost.output`
 
