@@ -82,11 +82,14 @@ class TestChooseEngine:
 
     def test_threshold_depends_on_model_size(self, monkeypatch):
         monkeypatch.delenv("PHOLDLIB_PACKED_MIN_RESIDUES", raising=False)
+        monkeypatch.setattr(inference, "is_rocm", lambda: False)
         small = torch.nn.Linear(10, 10)
         big = types.SimpleNamespace(parameters=lambda: [torch.empty(300_000_000, dtype=torch.int8)])
         assert inference.packed_min_residues(small) == inference.PACKED_MIN_RESIDUES
         assert inference.packed_min_residues(big) == inference.PACKED_MIN_RESIDUES_LARGE_MODEL
         assert inference.packed_min_residues(None) == inference.PACKED_MIN_RESIDUES
+        monkeypatch.setattr(inference, "is_rocm", lambda: True)
+        assert inference.packed_min_residues(small) == 2 * inference.PACKED_MIN_RESIDUES
 
     def test_explicit_requests(self, gpu):
         m = fake_model()

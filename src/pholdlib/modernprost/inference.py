@@ -30,7 +30,8 @@ The input is tokenised once with a lookup table (see
     :mod:`pholdlib.modernprost.packed`).
 
 ``engine="auto"`` with ``compile="auto"`` picks, for inputs of at least
-20M residues (5M for the 1B checkpoints; see :func:`packed_min_residues`):
+20M residues (5M for the 1B checkpoints, both doubled on ROCm; see
+:func:`packed_min_residues`):
 the packed engine on NVIDIA GPUs (fastest there), the padded engine under
 ``torch.compile`` on AMD/ROCm GPUs (Triton's FlexAttention kernels are slow on
 MI250X, so packing does not pay), and the eager padded engine everywhere
@@ -83,10 +84,13 @@ DEFAULT_PACK_TOKENS = 65536
 # least this many residues: below it the one-off compile (~30-60 s cold)
 # costs more than it saves. Measured break-even against the eager padded
 # engine on an A100: ~17M residues for the 50M checkpoints (which save
-# ~1.7 us/residue) and ~6M for the 1B checkpoints (~7 us/residue).
+# ~1.7 us/residue) and ~6M for the 1B checkpoints (~7 us/residue). On ROCm
+# (MI250X) the compiled padded engine saves less and compiles slower
+# (break-even ~26M for 50M), so the thresholds double there.
 # Override with PHOLDLIB_PACKED_MIN_RESIDUES.
 PACKED_MIN_RESIDUES = 20_000_000
 PACKED_MIN_RESIDUES_LARGE_MODEL = 5_000_000
+_ROCM_THRESHOLD_FACTOR = 2
 _LARGE_MODEL_PARAMS = 200_000_000
 
 # Kept for compatibility: the chunk marker used in temporary item ids.
@@ -421,7 +425,8 @@ def _log_chunking(items: TokenisedItems, chunk_len: int) -> None:
 def packed_min_residues(model=None) -> int:
     """Residue count from which ``compile="auto"`` compiles (and
     ``engine="auto"`` may pack): ``PHOLDLIB_PACKED_MIN_RESIDUES`` if set,
-    else 20M for the ~50M-parameter checkpoints and 5M for the ~1B ones."""
+    else 20M for the ~50M-parameter checkpoints and 5M for the ~1B ones,
+    doubled on ROCm."""
     env = os.environ.get("PHOLDLIB_PACKED_MIN_RESIDUES")
     if env:
         try:
@@ -432,7 +437,8 @@ def packed_min_residues(model=None) -> int:
         n_params = sum(p.numel() for p in model.parameters())
     except (AttributeError, TypeError):
         n_params = 0
-    return PACKED_MIN_RESIDUES_LARGE_MODEL if n_params >= _LARGE_MODEL_PARAMS else PACKED_MIN_RESIDUES
+    base = PACKED_MIN_RESIDUES_LARGE_MODEL if n_params >= _LARGE_MODEL_PARAMS else PACKED_MIN_RESIDUES
+    return base * _ROCM_THRESHOLD_FACTOR if is_rocm() else base
 
 
 COMPILE_MODES = ("auto", "on", "off", "full", "flex", "dynamic", "none")
