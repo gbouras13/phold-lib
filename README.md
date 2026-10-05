@@ -178,7 +178,7 @@ generate_combined_foldseek_db(
 |---|---|
 | `get_modernprost_model(model_dir, model_name, cpu, threads, check_fn, zenodo_fn, device, half_precision)` | Load a ModernProst model + tokenizer. Returns `(model, tokenizer, device)`. |
 | `run_modernprost_inference(seq_dict, model, tokenizer, device, task=..., engine="auto", compile="auto", max_residues=65536, ...)` | Batch inference with one loaded model. Returns a `ModernProstResult`. |
-| `run_modernprost_inference_multi_gpu(seq_dict, devices, model_dir, model_name, ...)` | Loads one model per device (sequentially: HuggingFace's loader is not thread-safe), then one worker thread per device pulls batches from a shared queue into one set of output buffers. |
+| `run_modernprost_inference_multi_gpu(seq_dict, devices, model_dir, model_name, ...)` | Tokenises and plans once; one worker per device pulls batches from a shared queue into one set of output buffers. Workers are threads for eager runs; with `torch.compile` on several GPUs they are processes (this one drives the first GPU, spawned workers the rest, sharing buffers through shared memory), because compilation is serialised within a process (~20-25 s per A100) but runs in parallel across processes. |
 
 `ModernProstResult` fields:
 

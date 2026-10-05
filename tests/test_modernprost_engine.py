@@ -180,6 +180,25 @@ class TestOutputStore:
         assert res.embeddings_per_residue["b"].shape == (2, 4)
         assert res.embeddings_per_protein["b"].shape == (4,)
 
+    def test_shared_store_and_unfinished_items(self):
+        items = self._items()   # 5 items: 7, 9, 8, 8, 2 residues
+        parent = inference._OutputStore(items, "classification", want_hidden=False, hidden_size=4,
+                                        shared=True)
+        child = inference._OutputStore.attach(items, "classification", False, parent.tensors)
+        L = int(items.lengths[0])
+        child.write(np.array([0]), {"p3": np.full(L, 5, np.int8), "p12": np.zeros(L, np.int8),
+                                    "q3": np.ones(L, np.float32), "q12": np.ones(L, np.float32)})
+        assert parent.arrays["p3"][:L].tolist() == [5] * L      # visible through shared memory
+        child.fail(np.array([2]))
+        parent.failed_items.extend(child.failed_items)
+        assert parent.unfinished().tolist() == [1, 3, 4]
+
+    def test_zero_length_items_start_done(self):
+        seqs = [("empty", "", 0), ("a", "MK", 2)]
+        items = batching.TokenisedItems.from_sequences(seqs, LUT, chunk_len=10)
+        store = inference._OutputStore(items, "pssm", want_hidden=False, hidden_size=4)
+        assert store.unfinished().tolist() == [1]
+
     def test_segment_means(self):
         values = np.arange(10, dtype=np.float32)
         offsets = np.array([0, 3, 3, 10])
