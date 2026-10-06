@@ -179,13 +179,18 @@ def plan_padded_batches(
     token_budget: int,
     pad_multiple: int = 8,
     max_batch: Optional[int] = None,
+    max_scores: Optional[int] = None,
 ) -> List[np.ndarray]:
     """Group items into padded batches bounded by computed tokens.
 
     Items are visited longest-first. A batch closes when adding the next item
     would make ``rows x padded_length`` exceed ``token_budget`` (the padded
-    length is set by the batch's first, longest item) or when ``max_batch``
-    rows are reached. An item longer than the budget gets a batch of its own.
+    length is set by the batch's first, longest item), when ``max_batch``
+    rows are reached, or when ``rows x padded_length**2`` would exceed
+    ``max_scores``. The last bound is for devices whose attention
+    materialises the full score matrix (MPS, CPU): it keeps batches of long
+    proteins small while short proteins still fill the token budget. An item
+    longer than the budget gets a batch of its own.
 
     Returns:
         A list of item-index arrays, longest batches first.
@@ -199,6 +204,8 @@ def plan_padded_batches(
         rows = max(1, token_budget // max(lpad, 1))
         if max_batch:
             rows = min(rows, max_batch)
+        if max_scores:
+            rows = max(1, min(rows, max_scores // max(lpad * lpad, 1)))
         end = min(n, start + rows)
         batches.append(order[start:end])
         start = end

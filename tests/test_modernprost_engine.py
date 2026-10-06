@@ -123,6 +123,23 @@ class TestChooseEngine:
         assert not ok
 
 
+class TestDefaultTokenBudget:
+    def test_per_device(self):
+        assert inference.default_token_budget(torch.device("cuda")) == inference.DEFAULT_TOKEN_BUDGET
+        assert inference.default_token_budget(torch.device("cpu")) == 4096
+        assert inference.default_token_budget(torch.device("mps")) == 4096
+
+    def test_plan_uses_device_default(self):
+        seqs = [(f"p{i}", "M" * 100, 100) for i in range(100)]
+        items = batching.TokenisedItems.from_sequences(seqs, LUT, chunk_len=1000)
+        cpu = inference._plan(items, "padded", None, 8, None, 65536, torch.device("cpu"))
+        gpu = inference._plan(items, "padded", None, 8, None, 65536, torch.device("cuda"))
+        assert max(len(b) for b in cpu) == 4096 // 104
+        assert len(gpu) == 1
+        explicit = inference._plan(items, "padded", 1040, 8, None, 65536, torch.device("cuda"))
+        assert max(len(b) for b in explicit) == 10
+
+
 class TestFitPackTokens:
     def test_grows_rows_for_long_chunks(self):
         seqs = [("long", "A" * 5000, 5000), ("short", "M" * 10, 10)]
@@ -205,6 +222,55 @@ class TestOutputStore:
         assert inference._segment_means(values, offsets).tolist() == [1.0, 0.0, 6.0]
         v2 = np.arange(20, dtype=np.float32).reshape(10, 2)
         assert inference._segment_means(v2, offsets)[2].tolist() == [12.0, 13.0]
+
+
+class _OOMRunner:
+    """Fake runner: runs batches of up to ``limit`` items, else raises the
+    plain RuntimeError MPS uses for out-of-memory."""
+
+    device = torch.device("cpu")
+
+    def __init__(self, limit):
+        self.limit = limit
+        self.ok_sizes = []
+
+    def launch(self, items, batch):
+        if len(batch) > self.limit:
+            raise RuntimeError("MPS backend out of memory (fake)")
+        self.ok_sizes.append(len(batch))
+        n = int(items.lengths[batch].sum())
+        return torch.zeros(n, 20), torch.zeros(n, 12), None
+
+
+class TestOutOfMemoryBackoff:
+    def _items(self, n=10):
+        seqs = [(f"p{i}", "MKTAYIAK"[: 2 + i % 6], 2 + i % 6) for i in range(n)]
+        return batching.TokenisedItems.from_sequences(seqs, LUT, chunk_len=100)
+
+    def test_oom_batches_are_split_until_they_fit(self):
+        items = self._items()
+        store = inference._OutputStore(items, "classification", want_hidden=False, hidden_size=4)
+        runner = _OOMRunner(limit=3)
+        done = []
+        inference._drive(runner, items, [np.arange(items.n_items)], store, done.append)
+        assert not store.failed_items and len(store.unfinished()) == 0
+        assert max(runner.ok_sizes) <= 3 and sum(done) == items.n_items
+
+    def test_single_items_that_do_not_fit_fail(self):
+        items = self._items(4)
+        store = inference._OutputStore(items, "classification", want_hidden=False, hidden_size=4)
+        inference._drive(_OOMRunner(limit=0), items, [np.arange(items.n_items)], store, lambda n: None)
+        failed = sorted(int(i) for b in store.failed_items for i in b)
+        assert failed == [0, 1, 2, 3]
+
+    def test_other_errors_fail_the_batch(self):
+        class Broken(_OOMRunner):
+            def launch(self, items, batch):
+                raise RuntimeError("something else")
+        items = self._items(4)
+        store = inference._OutputStore(items, "classification", want_hidden=False, hidden_size=4)
+        inference._drive(Broken(limit=10), items, [np.arange(4)], store, lambda n: None)
+        assert len(store.failed_items) == 1 and len(store.failed_items[0]) == 4
 
 
 # ===========================================================================

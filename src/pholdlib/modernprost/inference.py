@@ -49,6 +49,7 @@ no EOS, so logit position *i* is residue *i*.
 
 import os
 import queue as queue_mod
+from collections import deque
 import threading
 import time
 import traceback
@@ -79,8 +80,13 @@ from pholdlib.modernprost.batching import (
 DEFAULT_CHUNK_LEN = 1568
 
 # Default padded-token budget per batch (rows x padded length) for the padded
-# engine, and tokens per packed row for the packed engine.
+# engine, and tokens per packed row for the packed engine. GPUs with
+# memory-efficient attention (CUDA, ROCm) want big batches; on Apple MPS and
+# CPU attention materialises the score matrix and small batches are faster
+# (M1 Pro: 4096 tokens 6.5k residues/s vs 3.5k at 65536 on MPS; 3.6k vs 3.3k
+# at 16384 on CPU).
 DEFAULT_TOKEN_BUDGET = 65536
+DEFAULT_TOKEN_BUDGET_NO_FUSED_ATTENTION = 4096
 DEFAULT_PACK_TOKENS = 65536
 
 # compile="auto" compiles (and engine="auto" may pack) only for inputs of at
@@ -96,6 +102,13 @@ PACKED_MIN_RESIDUES_LARGE_MODEL = 5_000_000
 _ROCM_THRESHOLD_FACTOR = 2
 _LARGE_MODEL_PARAMS = 200_000_000
 
+# On devices whose attention materialises the score matrix (MPS, CPU, XPU),
+# padded batches are also capped at this many attention scores (rows x
+# padded_length^2 x heads): ~1 GB in fp16 per attention call, about the worst
+# case of the old --batch_size 20 runs. CUDA and ROCm use memory-efficient
+# SDPA kernels and are bounded by the token budget alone.
+MATERIALISED_SCORE_BUDGET = 500_000_000
+
 # Kept for compatibility: the chunk marker used in temporary item ids.
 _CHUNK_SEP = CHUNK_SEP
 
@@ -105,6 +118,7 @@ __all__ = [
     "DEFAULT_CHUNK_LEN",
     "DEFAULT_PACK_TOKENS",
     "DEFAULT_TOKEN_BUDGET",
+    "DEFAULT_TOKEN_BUDGET_NO_FUSED_ATTENTION",
     "ENGINES",
     "ModernProstResult",
     "PACKED_MIN_RESIDUES",
@@ -186,7 +200,7 @@ def run_modernprost_inference(
     tokenizer,
     device: torch.device,
     task: str = CLASSIFICATION_TASK,
-    max_residues: int = DEFAULT_TOKEN_BUDGET,
+    max_residues: Optional[int] = None,
     max_seq_len: int = 30000,
     max_batch: Optional[int] = None,
     chunk_len: int = DEFAULT_CHUNK_LEN,
@@ -212,6 +226,7 @@ def run_modernprost_inference(
         task: ``"classification"`` or ``"pssm"``.
         max_residues: padded engine only: computed-token budget per batch
             (rows x padded length). Padding is counted, so this bounds memory.
+            None picks per device: 65536 on CUDA / ROCm, 4096 on MPS and CPU.
         max_seq_len: unused; kept for call-site compatibility (chunking keeps
             every item at or below ``chunk_len``).
         max_batch: padded engine only: optional cap on rows per batch.
@@ -243,7 +258,8 @@ def run_modernprost_inference(
     pack_tokens = _fit_pack_tokens(items, chosen, pack_tokens)
     store = _OutputStore(items, task, save_per_residue_embeddings or save_per_protein_embeddings,
                          hidden_size=int(model.config.hidden_size))
-    batches = _plan(items, chosen, max_residues, pad_multiple, max_batch, pack_tokens)
+    batches = _plan(items, chosen, max_residues, pad_multiple, max_batch, pack_tokens, device,
+                    _score_cap(device, model))
     runner = _make_runner(chosen, model, device, mode, pack_tokens, pad_multiple,
                           n_encoders=1, want_hidden=store.want_hidden)
 
@@ -270,7 +286,7 @@ def run_modernprost_inference_multi_gpu(
     task: str = CLASSIFICATION_TASK,
     check_fn: Optional[Callable] = None,
     zenodo_fn: Optional[Callable] = None,
-    max_residues: int = DEFAULT_TOKEN_BUDGET,
+    max_residues: Optional[int] = None,
     max_seq_len: int = 30000,
     max_batch: Optional[int] = None,
     chunk_len: int = DEFAULT_CHUNK_LEN,
@@ -350,7 +366,8 @@ def run_modernprost_inference_multi_gpu(
     want_hidden = save_per_residue_embeddings or save_per_protein_embeddings
     store = _OutputStore(items, task, want_hidden, hidden_size=int(model0.config.hidden_size),
                          shared=use_processes)
-    batches = _plan(items, chosen, max_residues, pad_multiple, max_batch, pack_tokens)
+    batches = _plan(items, chosen, max_residues, pad_multiple, max_batch, pack_tokens, device0,
+                    _score_cap(device0, model0))
     if len(devices) > 1:
         logger.info(
             f"Multi-GPU ModernProst inference across {len(devices)} device(s): {devices}. "
@@ -692,16 +709,33 @@ def _fit_pack_tokens(items: TokenisedItems, engine: str, pack_tokens: int) -> in
     return fitted
 
 
-def _plan(items: TokenisedItems, engine: str, max_residues: int, pad_multiple: int,
-          max_batch: Optional[int], pack_tokens: int) -> List[np.ndarray]:
+def _score_cap(device: torch.device, model) -> Optional[int]:
+    """Per-head attention-score cap for padded batches on devices without
+    memory-efficient attention (see MATERIALISED_SCORE_BUDGET)."""
+    if torch.device(device).type == "cuda":
+        return None
+    heads = int(getattr(model.config, "num_attention_heads", 1) or 1)
+    return MATERIALISED_SCORE_BUDGET // heads
+
+
+def default_token_budget(device) -> int:
+    """Padded-engine token budget used when ``max_residues`` is None."""
+    if torch.device(device).type == "cuda":
+        return DEFAULT_TOKEN_BUDGET
+    return DEFAULT_TOKEN_BUDGET_NO_FUSED_ATTENTION
+
+
+def _plan(items: TokenisedItems, engine: str, max_residues: Optional[int], pad_multiple: int,
+          max_batch: Optional[int], pack_tokens: int, device,
+          max_scores: Optional[int] = None) -> List[np.ndarray]:
     """Batches of item indices; zero-length items are never sent to the model."""
     lengths = items.lengths
     nonempty = np.flatnonzero(lengths > 0)
     if engine == "packed":
         sub = plan_packed_batches(lengths[nonempty], pack_tokens)
     else:
-        budget = max_residues if max_residues and max_residues > 0 else DEFAULT_TOKEN_BUDGET
-        sub = plan_padded_batches(lengths[nonempty], budget, pad_multiple, max_batch)
+        budget = max_residues if max_residues and max_residues > 0 else default_token_budget(device)
+        sub = plan_padded_batches(lengths[nonempty], budget, pad_multiple, max_batch, max_scores)
     return [nonempty[b] for b in sub]
 
 
@@ -867,12 +901,13 @@ def _make_runner(engine: str, model, device: torch.device, mode: str, pack_token
             primary = _PackedRunner(model, device, mode, pack_tokens, n_encoders)
         except Exception as exc:  # noqa: BLE001 - any setup failure falls back
             logger.warning(f"Packed ModernProst engine failed to start ({exc}); using the padded engine.")
-            return eager_padded()
+            primary = eager_padded()
     else:
         primary = _PaddedRunner(model, device, pad_multiple, mode, want_hidden)
-    if primary.compiled:
-        return _FallbackRunner(primary, eager_padded)
-    return primary
+    runner = _FallbackRunner(primary, eager_padded) if primary.compiled else primary
+    # used by _drive to retry a batch that ran out of memory
+    runner.make_eager_padded = eager_padded
+    return runner
 
 
 def _to_device(a: np.ndarray, device: torch.device, pin: bool) -> torch.Tensor:
@@ -883,8 +918,18 @@ def _to_device(a: np.ndarray, device: torch.device, pin: bool) -> torch.Tensor:
 
 
 def _is_oom(exc: BaseException) -> bool:
-    return isinstance(exc, torch.OutOfMemoryError) if hasattr(torch, "OutOfMemoryError") \
-        else "out of memory" in str(exc).lower()
+    # CUDA/ROCm raise torch.OutOfMemoryError; MPS raises a plain RuntimeError
+    # ("MPS backend out of memory")
+    if hasattr(torch, "OutOfMemoryError") and isinstance(exc, torch.OutOfMemoryError):
+        return True
+    return "out of memory" in str(exc).lower()
+
+
+def _free_memory(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    elif device.type == "mps" and hasattr(torch, "mps"):
+        torch.mps.empty_cache()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1053,10 +1098,43 @@ def _drive(runner, items: TokenisedItems, batches: Iterable[np.ndarray], store: 
     """Run batches through ``runner`` and write their outputs into ``store``.
 
     The host-side copy and bookkeeping of batch *i* happen while the GPU runs
-    batch *i + 1*. A failing batch is recorded and skipped (its proteins end
-    up in ``fail_ids``), as the previous engine did.
+    batch *i + 1*. A batch that runs out of memory is retried rather than
+    failed: a packed row goes through the eager padded engine, and a padded
+    batch is split in half, recursively, so only a protein that cannot fit on
+    its own is recorded as a failure. Any other error records the batch's
+    proteins in ``fail_ids``, as the previous engine did.
     """
     pending: Optional[Tuple[np.ndarray, _HostCopy]] = None
+    retry: deque = deque()   # (batch, through_padded) waiting to be rerun
+    padded: List = []        # lazily built eager padded runner for retries
+    warned = [False]
+    source = iter(batches)
+
+    def next_work():
+        if retry:
+            return retry.popleft()
+        b = next(source, None)
+        return None if b is None else (b, False)
+
+    def on_oom(batch, through_padded, exc):
+        _free_memory(runner.device)
+        if not warned[0]:
+            logger.warning(
+                f"Out of memory on {runner.device} for a batch of {len(batch)} items "
+                f"({int(items.lengths[batch].sum())} residues); retrying it in smaller pieces. "
+                "A lower --max_batch_residues avoids the retries."
+            )
+            warned[0] = True
+        if not through_padded and hasattr(runner, "make_eager_padded") and not isinstance(
+                getattr(runner, "primary", runner), _PaddedRunner):
+            retry.appendleft((batch, True))           # packed row -> padded engine
+        elif len(batch) > 1:
+            half = len(batch) // 2                     # keeps longest-first order
+            retry.appendleft((batch[half:], through_padded))
+            retry.appendleft((batch[:half], through_padded))
+        else:
+            return False
+        return True
 
     def flush(entry):
         batch, copy = entry
@@ -1068,11 +1146,22 @@ def _drive(runner, items: TokenisedItems, batches: Iterable[np.ndarray], store: 
             store.write(batch, host)
         progress(len(batch))
 
-    for batch in batches:
+    while True:
+        work = next_work()
+        if work is None:
+            break
+        batch, through_padded = work
+        use = runner
+        if through_padded:
+            if not padded:
+                padded.append(runner.make_eager_padded())
+            use = padded[0]
         try:
-            l3, l12, hid = runner.launch(items, batch)
+            l3, l12, hid = use.launch(items, batch)
             copy = _HostCopy(store.device_outputs(l3, l12, hid))
         except RuntimeError as exc:
+            if _is_oom(exc) and on_oom(batch, through_padded, exc):
+                continue
             _record_failure(store, items, batch, exc)
             progress(len(batch))
             continue
@@ -1091,8 +1180,6 @@ def _record_failure(store: _OutputStore, items: TokenisedItems, batch: np.ndarra
         + (f"; first ids: {ids[:5]}" if ids else "") + f" ({exc})"
     )
     store.fail(batch)
-    if _is_oom(exc) and torch.cuda.is_available():
-        torch.cuda.empty_cache()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

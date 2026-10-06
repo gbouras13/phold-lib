@@ -140,6 +140,14 @@ class TestPlanPadded:
         batches = _b.plan_padded_batches(np.full(100, 10), 10 ** 6, 8, max_batch=7)
         assert max(len(b) for b in batches) == 7
 
+    def test_score_cap_limits_long_batches_only(self):
+        lengths = np.array([1600] * 50 + [100] * 2000)
+        batches = _b.plan_padded_batches(lengths, 65536, 8, max_scores=10 * 1600 * 1600)
+        long_rows = [len(b) for b in batches if lengths[b[0]] == 1600]
+        short_rows = [len(b) for b in batches if lengths[b[0]] == 100]
+        assert max(long_rows) == 10             # capped by scores
+        assert max(short_rows) == 65536 // 104  # still filled by tokens
+
     def test_oversized_item_gets_own_batch(self):
         batches = _b.plan_padded_batches(np.array([5000, 10, 10]), 1024, 8)
         assert [len(b) for b in batches] == [1, 2]

@@ -37,6 +37,8 @@ _EXPORTS = {
     "predictions_from_profiles": "inference",
     "DEFAULT_CHUNK_LEN": "inference",
     "DEFAULT_TOKEN_BUDGET": "inference",
+    "DEFAULT_TOKEN_BUDGET_NO_FUSED_ATTENTION": "inference",
+    "default_token_budget": "inference",
     "DEFAULT_PACK_TOKENS": "inference",
     "PACKED_MIN_RESIDUES": "inference",
     "packed_min_residues": "inference",
