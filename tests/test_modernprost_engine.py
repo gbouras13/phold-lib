@@ -76,6 +76,47 @@ class TestChooseEngine:
         monkeypatch.setattr(inference, "is_rocm", lambda: True)
         assert inference._choose_engine("auto", "auto", gpu, fake_model(), self.BIG) == ("padded", "dynamic")
 
+    def test_threshold_applies_per_device(self, gpu, monkeypatch):
+        # every device compiles once but only processes its share of the input
+        monkeypatch.delenv("PHOLDLIB_PACKED_MIN_RESIDUES", raising=False)
+        m = fake_model()
+        n = 4 * inference.PACKED_MIN_RESIDUES
+        assert inference._choose_engine("auto", "auto", gpu, m, n, n_devices=4) == ("packed", "full")
+        assert inference._choose_engine("auto", "auto", gpu, m, n, n_devices=8) == ("padded", "none")
+        assert inference._choose_engine("auto", "on", gpu, m, n, n_devices=8) == ("packed", "full")
+        monkeypatch.setattr(inference, "is_rocm", lambda: True)  # threshold doubles
+        assert inference._choose_engine("auto", "auto", gpu, m, n, n_devices=2) == ("padded", "dynamic")
+        assert inference._choose_engine("auto", "auto", gpu, m, n, n_devices=4) == ("padded", "none")
+
+    def test_multi_gpu_passes_device_count(self, monkeypatch):
+        pytest.importorskip("transformers")
+        from pholdlib.modernprost import model as model_mod
+
+        class Tokenizer:
+            unk_token = "<unk>"
+
+            def get_vocab(self):
+                return VOCAB
+
+        class Stop(Exception):
+            pass
+
+        seen = {}
+
+        def record(engine, compile, device, model, n_tokens, n_devices=1):
+            seen.update(n_tokens=n_tokens, n_devices=n_devices)
+            raise Stop
+
+        monkeypatch.setattr(model_mod, "get_modernprost_model",
+                            lambda *a, **k: (fake_model(), Tokenizer(), torch.device("cpu")))
+        monkeypatch.setattr(model_mod, "count_parameters", lambda m: 0)
+        monkeypatch.setattr(inference, "_choose_engine", record)
+        with pytest.raises(Stop):
+            inference.run_modernprost_inference_multi_gpu(
+                [("a", "ACDEFG", 6), ("b", "KLMN", 4)], ["cuda:0", "cuda:1", "cuda:2"],
+                model_dir="unused", model_name="modernprost-50M", half_precision=False, threads=1)
+        assert seen == {"n_tokens": 10, "n_devices": 3}
+
     def test_threshold_env_override(self, gpu, monkeypatch):
         monkeypatch.setenv("PHOLDLIB_PACKED_MIN_RESIDUES", "500")
         assert inference._choose_engine("auto", "auto", gpu, fake_model(), self.SMALL) == ("packed", "full")

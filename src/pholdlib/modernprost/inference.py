@@ -30,13 +30,13 @@ The input is tokenised once with a lookup table (see
     :mod:`pholdlib.modernprost.packed`).
 
 ``engine="auto"`` with ``compile="auto"`` picks, for inputs of at least
-20M residues (5M for the 1B checkpoints, both doubled on ROCm; see
+20M residues per GPU (5M for the 1B checkpoints, both doubled on ROCm; see
 :func:`packed_min_residues`):
 the packed engine on NVIDIA GPUs (fastest there), the padded engine under
 ``torch.compile`` on AMD/ROCm GPUs (Triton's FlexAttention kernels are slow on
 MI250X, so packing does not pay), and the eager padded engine everywhere
 else. Smaller inputs use the eager padded engine, because compiling costs
-tens of seconds.
+tens of seconds on every GPU.
 
 On GPUs both engines do the softmax / argmax on the device, copy back only
 real (unpadded) tokens once per batch, and overlap the host-side bookkeeping
@@ -89,14 +89,16 @@ DEFAULT_TOKEN_BUDGET = 65536
 DEFAULT_TOKEN_BUDGET_NO_FUSED_ATTENTION = 4096
 DEFAULT_PACK_TOKENS = 65536
 
-# compile="auto" compiles (and engine="auto" may pack) only for inputs of at
-# least this many residues: below it the one-off compile (~30-60 s cold)
-# costs more than it saves. Measured break-even against the eager padded
-# engine on an A100: ~17M residues for the 50M checkpoints (which save
-# ~1.7 us/residue) and ~6M for the 1B checkpoints (~7 us/residue). On ROCm
-# (MI250X) the compiled padded engine saves less and compiles slower
-# (break-even ~26M for 50M), so the thresholds double there.
-# Override with PHOLDLIB_PACKED_MIN_RESIDUES.
+# compile="auto" compiles (and engine="auto" may pack) only when each
+# device's share of the input is at least this many residues: below it the
+# one-off compile (~30-60 s cold, paid by every device) costs more than it
+# saves. Measured break-even against the eager padded engine on an A100:
+# ~17M residues for the 50M checkpoints (which save ~1.7 us/residue) and ~6M
+# for the 1B checkpoints (~7 us/residue). On ROCm (MI250X) the compiled
+# padded engine saves less and compiles slower (break-even ~26M for 50M), so
+# the thresholds double there. The share is what counts on several devices:
+# on 8 MI250X GCDs, 109.5M residues (13.7M each) took 83 s eager against
+# 128 s compiled. Override with PHOLDLIB_PACKED_MIN_RESIDUES.
 PACKED_MIN_RESIDUES = 20_000_000
 PACKED_MIN_RESIDUES_LARGE_MODEL = 5_000_000
 _ROCM_THRESHOLD_FACTOR = 2
@@ -316,6 +318,11 @@ def run_modernprost_inference_multi_gpu(
     process drives the first device; spawned workers drive the others and
     share the token and output buffers through shared memory.
 
+    With ``compile="auto"``, the compile threshold
+    (:func:`packed_min_residues`) applies to each device's share of the
+    input: every device compiles once but then processes only about
+    ``1 / len(devices)`` of the residues.
+
     Args:
         devices: device strings from :func:`pholdlib.prostt5.device.parse_gpus`.
         model_dir / model_name / half_precision / threads / check_fn / zenodo_fn:
@@ -359,7 +366,8 @@ def run_modernprost_inference_multi_gpu(
 
     items = TokenisedItems.from_sequences(seq_dict, lut_from_tokenizer(tokenizer), chunk_len)
     _log_chunking(items, chunk_len)
-    chosen, mode = _choose_engine(engine, compile, device0, model0, items.n_tokens)
+    chosen, mode = _choose_engine(engine, compile, device0, model0, items.n_tokens,
+                                  n_devices=len(devices))
     pack_tokens = _fit_pack_tokens(items, chosen, pack_tokens)
     use_processes = (len(devices) > 1 and mode != "none"
                      and all(str(d).startswith("cuda") for d in devices))
@@ -613,7 +621,7 @@ def _log_chunking(items: TokenisedItems, chunk_len: int) -> None:
 
 
 def packed_min_residues(model=None) -> int:
-    """Residue count from which ``compile="auto"`` compiles (and
+    """Residues per device from which ``compile="auto"`` compiles (and
     ``engine="auto"`` may pack): ``PHOLDLIB_PACKED_MIN_RESIDUES`` if set,
     else 20M for the ~50M-parameter checkpoints and 5M for the ~1B ones,
     doubled on ROCm."""
@@ -641,15 +649,17 @@ def is_rocm() -> bool:
 
 
 def _choose_engine(engine: str, compile: str, device: torch.device, model,
-                   n_tokens: int) -> Tuple[str, str]:
+                   n_tokens: int, n_devices: int = 1) -> Tuple[str, str]:
     """Resolve the user's ``engine`` / ``compile`` request to a concrete
     ``(engine, compile_mode)``.
 
     compile modes: ``"full"`` / ``"flex"`` (packed engine), ``"dynamic"``
     (padded engine under ``torch.compile(dynamic=True)``) and ``"none"``.
     ``"on"`` means full for packed and dynamic for padded; ``"off"`` = none;
-    ``"auto"`` compiles only on a GPU and only for inputs of at least
-    :func:`packed_min_residues` residues (which depends on model size).
+    ``"auto"`` compiles only on a GPU and only when each of the
+    ``n_devices`` devices gets at least :func:`packed_min_residues`
+    residues (which depends on model size): every device pays for
+    compiling, but only its own share of the input pays it back.
     """
     engine = str(engine).lower()
     compile = str(compile).lower() if compile is not None else "auto"
@@ -660,7 +670,9 @@ def _choose_engine(engine: str, compile: str, device: torch.device, model,
 
     on_gpu = torch.device(device).type == "cuda"
     threshold = packed_min_residues(model)
-    large = n_tokens >= threshold
+    n_devices = max(1, int(n_devices))
+    per_device = n_tokens / n_devices
+    large = per_device >= threshold
     want_compile = compile in ("on", "full", "flex", "dynamic") or (compile == "auto" and on_gpu and large)
 
     from pholdlib.modernprost.packed import packed_engine_status
@@ -686,11 +698,20 @@ def _choose_engine(engine: str, compile: str, device: torch.device, model,
     if engine == "padded":
         # "full"/"flex" name packed modes; the padded equivalent is dynamic
         mode = "dynamic" if want_compile else "none"
-    if mode != "none" and compile == "auto":
-        logger.info(
-            f"{n_tokens:,} residues >= {threshold:,}: using the {engine} ModernProst engine "
-            f"with torch.compile ({mode}); the first batch compiles, then it runs faster."
-        )
+    if compile == "auto" and on_gpu:
+        share = (f"{n_tokens:,} residues" if n_devices == 1 else
+                 f"{n_tokens:,} residues over {n_devices} devices ({per_device:,.0f} each)")
+        if mode != "none" and large:
+            logger.info(
+                f"{share} >= {threshold:,}: using the {engine} ModernProst engine "
+                f"with torch.compile ({mode}); the first batch compiles, then it runs faster."
+            )
+        elif mode == "none" and n_tokens >= threshold:
+            logger.info(
+                f"{share}, below {threshold:,} per device: using the eager {engine} ModernProst "
+                f"engine, because compiling on every device would cost more than it saves "
+                f"(compile='on' compiles anyway)."
+            )
     return engine, mode
 
 
