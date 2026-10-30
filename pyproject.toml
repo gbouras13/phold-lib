@@ -4,8 +4,8 @@ requires = ["setuptools>=61.0", "wheel>=0.37.1"]
 
 [project]
 name = "pholdlib"
-version = "0.1.2"
-description = "Shared ProstT5 inference library for phold and baktfold"
+version = "0.3.0"
+description = "Shared ProstT5 and ModernProst 3Di/12-state inference library for phold and baktfold"
 readme = "README.md"
 requires-python = ">=3.8, <4"
 license = {file = "MIT"}
@@ -28,7 +28,13 @@ dependencies = [
     "requests >=2.25",
     "sentencepiece >=0.1.99",
     "protobuf >=3.20",
-    "transformers >=4.34",
+    # >=4.51: the -pssm ModernProst checkpoints import their config inside a
+    # try/except. transformers <4.51 scans custom code for imports with a
+    # regex that strips the try body but not the except body, sees
+    # `from configuration_modernprost_3di12st import ...` and refuses to load
+    # ("requires ... configuration_modernprost_3di12st"). 4.51 parses with
+    # `ast` and skips try/except blocks.
+    "transformers >=4.51",
     "torch >=2.1.2",
     # Loosened from `>=2.0` to `>=1.24` so consumer projects (phold,
     # baktfold) installed in environments with Debian-managed numpy
