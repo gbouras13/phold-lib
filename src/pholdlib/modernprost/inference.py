@@ -3,10 +3,6 @@
 """
 ModernProst 3Di + 12-state batch inference engine.
 
-Adapted from foldseek2-plm's ``infer-pure`` inference loop, restructured to
-match :mod:`pholdlib.prostt5.inference` so phold and baktfold can drive either
-backend through the same call shape.
-
 Two tasks are supported:
 
 ``classification``
@@ -16,40 +12,66 @@ Two tasks are supported:
 
 ``pssm``
     keep the full per-residue softmax distributions — ``(L, 20)`` and
-    ``(L, 12)`` float arrays. Feeds the Foldseek profile DBs. Memory is ~32x
-    the classification path per residue, which is why it is opt-in.
+    ``(L, 12)`` float arrays. Feeds the Foldseek profile DBs.
 
-Differences from the ProstT5 engine that matter when reading this code:
+The input is tokenised once with a lookup table (see
+:mod:`pholdlib.modernprost.batching`) and then run through one of two engines:
 
-* No ``<AA2fold>`` prefix token and no EOS, so logit position *i* is residue
-  *i* — there is no index shift and no attention-mask patching.
-* Sequences longer than ``chunk_len`` are split into near-equal chunks,
-  inferred independently and stitched back together, because attention cost
-  grows quadratically in the global-attention layers.
-* Batches are padded up to a multiple of 64 so Tensor Cores hit peak on the
-  padded dimension.
+``padded``
+    One protein per row, longest first, rows padded to a multiple of 8, and a
+    batch bounded by *computed* tokens (rows x padded length <= budget).
+    Works on every device and uses the checkpoint's own forward.
+
+``packed``
+    Proteins concatenated into fixed rows of ``pack_tokens`` tokens, with
+    FlexAttention masks that keep each protein to itself and give the sliding
+    layers their real windowed cost; the forward is compiled once. Needs a
+    CUDA or ROCm GPU with PyTorch >= 2.5 and Triton (see
+    :mod:`pholdlib.modernprost.packed`).
+
+``engine="auto"`` with ``compile="auto"`` picks, for inputs of at least
+20M residues per GPU (5M for the 1B checkpoints, both doubled on ROCm; see
+:func:`packed_min_residues`):
+the packed engine on NVIDIA GPUs (fastest there), the padded engine under
+``torch.compile`` on AMD/ROCm GPUs (Triton's FlexAttention kernels are slow on
+MI250X, so packing does not pay), and the eager padded engine everywhere
+else. Smaller inputs use the eager padded engine, because compiling costs
+tens of seconds on every GPU.
+
+On GPUs both engines do the softmax / argmax on the device, copy back only
+real (unpadded) tokens once per batch, and overlap the host-side bookkeeping
+for one batch with the GPU work of the next.
+
+Sequences longer than ``chunk_len`` are split into near-equal chunks, inferred
+independently and stitched back together; there is no ``<AA2fold>`` prefix and
+no EOS, so logit position *i* is residue *i*.
 """
 
-import math
+import os
+import queue as queue_mod
+from collections import deque
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+import traceback
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 from loguru import logger
 from tqdm import tqdm
 
-from pholdlib.databases.modernprost import (
-    CLASSIFICATION_TASK,
-    PSSM_TASK,
-    VALID_TASKS,
+from pholdlib.databases.modernprost import CLASSIFICATION_TASK, PSSM_TASK, VALID_TASKS
+from pholdlib.modernprost.batching import (
+    CHUNK_SEP,
+    TokenisedItems,
+    chunk_sequence,
+    lut_from_tokenizer,
+    plan_packed_batches,
+    plan_padded_batches,
 )
-from pholdlib.prostt5.device import shard_round_robin
-from pholdlib.prostt5.model import toCPU
 
 # Sequences longer than this are split before inference. 1568 is the value
 # phold settled on for ModernProst: comfortably inside the model's 8192-token
@@ -57,18 +79,61 @@ from pholdlib.prostt5.model import toCPU
 # bounded on the long tail of phage proteins.
 DEFAULT_CHUNK_LEN = 1568
 
-# Chunk marker embedded in a temporary sequence id. Chosen to be absurd enough
-# that it cannot collide with a real CDS id from Pharokka/Bakta/NCBI.
-_CHUNK_SEP = "__chunk"
+# Default padded-token budget per batch (rows x padded length) for the padded
+# engine, and tokens per packed row for the packed engine. GPUs with
+# memory-efficient attention (CUDA, ROCm) want big batches; on Apple MPS and
+# CPU attention materialises the score matrix and small batches are faster
+# (M1 Pro: 4096 tokens 6.5k residues/s vs 3.5k at 65536 on MPS; 3.6k vs 3.3k
+# at 16384 on CPU).
+DEFAULT_TOKEN_BUDGET = 65536
+DEFAULT_TOKEN_BUDGET_NO_FUSED_ATTENTION = 4096
+DEFAULT_PACK_TOKENS = 65536
+
+# compile="auto" compiles (and engine="auto" may pack) only when each
+# device's share of the input is at least this many residues: below it the
+# one-off compile (~30-60 s cold, paid by every device) costs more than it
+# saves. Measured break-even against the eager padded engine on an A100:
+# ~17M residues for the 50M checkpoints (which save ~1.7 us/residue) and ~6M
+# for the 1B checkpoints (~7 us/residue). On ROCm (MI250X) the compiled
+# padded engine saves less and compiles slower (break-even ~26M for 50M), so
+# the thresholds double there. The share is what counts on several devices:
+# on 8 MI250X GCDs, 109.5M residues (13.7M each) took 83 s eager against
+# 128 s compiled. Override with PHOLDLIB_PACKED_MIN_RESIDUES.
+PACKED_MIN_RESIDUES = 20_000_000
+PACKED_MIN_RESIDUES_LARGE_MODEL = 5_000_000
+_ROCM_THRESHOLD_FACTOR = 2
+_LARGE_MODEL_PARAMS = 200_000_000
+
+# On devices whose attention materialises the score matrix (MPS, CPU, XPU),
+# padded batches are also capped at this many attention scores (rows x
+# padded_length^2 x heads): ~1 GB in fp16 per attention call, about the worst
+# case of the old --batch_size 20 runs. CUDA and ROCm use memory-efficient
+# SDPA kernels and are bounded by the token budget alone.
+MATERIALISED_SCORE_BUDGET = 500_000_000
+
+# Kept for compatibility: the chunk marker used in temporary item ids.
+_CHUNK_SEP = CHUNK_SEP
+
+ENGINES = ("auto", "padded", "packed")
+
+__all__ = [
+    "DEFAULT_CHUNK_LEN",
+    "DEFAULT_PACK_TOKENS",
+    "DEFAULT_TOKEN_BUDGET",
+    "DEFAULT_TOKEN_BUDGET_NO_FUSED_ATTENTION",
+    "ENGINES",
+    "ModernProstResult",
+    "PACKED_MIN_RESIDUES",
+    "chunk_sequence",
+    "predictions_from_profiles",
+    "run_modernprost_inference",
+    "run_modernprost_inference_multi_gpu",
+]
 
 
 @dataclass
 class ModernProstResult:
     """Everything one inference run produces.
-
-    A dataclass rather than the ProstT5 engine's 4-tuple because ModernProst
-    emits two heads plus two optional profile stores — a 7-tuple would be
-    unreadable at the call site.
 
     Attributes:
         predictions_3di / predictions_12st: ``{seq_id: (pred, mean_prob, all_prob)}``.
@@ -81,6 +146,9 @@ class ModernProstResult:
         embeddings_per_residue / embeddings_per_protein: optional embedding
             stores, keyed by seq_id.
         fail_ids: sequence IDs that could not be processed.
+
+    Arrays are views into per-run buffers; copy one before modifying it in
+    place if other entries must stay untouched.
     """
 
     predictions_3di: Dict[str, Tuple] = field(default_factory=dict)
@@ -92,7 +160,7 @@ class ModernProstResult:
     fail_ids: List[str] = field(default_factory=list)
 
     def update(self, other: "ModernProstResult") -> None:
-        """Merge another result in place (used to combine multi-GPU shards)."""
+        """Merge another result in place."""
         self.predictions_3di.update(other.predictions_3di)
         self.predictions_12st.update(other.predictions_12st)
         self.profiles_3di.update(other.profiles_3di)
@@ -100,27 +168,6 @@ class ModernProstResult:
         self.embeddings_per_residue.update(other.embeddings_per_residue)
         self.embeddings_per_protein.update(other.embeddings_per_protein)
         self.fail_ids.extend(other.fail_ids)
-
-
-def chunk_sequence(seq: str, max_len: int):
-    """Yield ``(start, subseq)`` splitting *seq* into near-equal chunks.
-
-    Chunks are non-overlapping and cover the sequence exactly; sizes differ by
-    at most one residue so no chunk is a tiny remainder. Splitting evenly
-    rather than taking ``max_len``-sized prefixes keeps every chunk in a
-    similar context regime, which matters because a 20-residue tail chunk
-    would be predicted with almost no structural context.
-    """
-    L = len(seq)
-    n_chunks = math.ceil(L / max_len)
-    base = L // n_chunks
-    remainder = L % n_chunks
-
-    start = 0
-    for i in range(n_chunks):
-        size = base + (1 if i < remainder else 0)
-        yield start, seq[start : start + size]
-        start += size
 
 
 def predictions_from_profiles(
@@ -145,265 +192,1020 @@ def predictions_from_profiles(
     return out
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Public entry points
+# ─────────────────────────────────────────────────────────────────────────────
+
 def run_modernprost_inference(
     seq_dict: List[Tuple[str, str, int]],
     model,
     tokenizer,
     device: torch.device,
     task: str = CLASSIFICATION_TASK,
-    max_residues: int = 50000,
+    max_residues: Optional[int] = None,
     max_seq_len: int = 30000,
-    max_batch: int = 10000,
+    max_batch: Optional[int] = None,
     chunk_len: int = DEFAULT_CHUNK_LEN,
     output_probs: bool = True,
     save_per_residue_embeddings: bool = False,
     save_per_protein_embeddings: bool = False,
-    pad_multiple: int = 64,
+    pad_multiple: int = 8,
     desc: str = "Predicting 3Di + 12st",
     progress_callback: Optional[Callable[[int], None]] = None,
+    engine: str = "auto",
+    compile: str = "auto",
+    pack_tokens: int = DEFAULT_PACK_TOKENS,
 ) -> ModernProstResult:
     """
-    Run ModernProst on a list of protein sequences.
+    Run ModernProst on a list of protein sequences with one loaded model.
 
     Args:
-        seq_dict: Pre-sorted (descending by length) list of
-            ``(seq_id, sequence, length)`` tuples. Non-standard amino acids are
-            replaced with X internally, so callers need not pre-clean.
-        model: ModernProst model from :func:`get_modernprost_model`.
-        tokenizer: matching tokenizer from :func:`get_modernprost_model`.
-        device: Torch device the model lives on.
+        seq_dict: ``(seq_id, sequence, length)`` tuples, in any order.
+            Non-standard amino acids are handled by the tokenizer table, so
+            callers need not pre-clean.
+        model / tokenizer: from :func:`get_modernprost_model`.
+        device: torch device the model lives on.
         task: ``"classification"`` or ``"pssm"``.
-        max_residues: Max total residues per batch before flushing.
-        max_seq_len: Any single chunk longer than this triggers an immediate flush.
-        max_batch: Max number of sequences (post-chunking) per batch.
-        chunk_len: Sequences longer than this are split before inference.
-        output_probs: When False, per-residue probability arrays are dropped
+        max_residues: padded engine only: computed-token budget per batch
+            (rows x padded length). Padding is counted, so this bounds memory.
+            None picks per device: 65536 on CUDA / ROCm, 4096 on MPS and CPU.
+        max_seq_len: unused; kept for call-site compatibility (chunking keeps
+            every item at or below ``chunk_len``).
+        max_batch: padded engine only: optional cap on rows per batch.
+        chunk_len: sequences longer than this are split before inference.
+        output_probs: when False, per-residue probability arrays are dropped
             from the result (the mean is still computed). Ignored for ``pssm``.
-        save_per_residue_embeddings: Collect per-residue ``last_hidden_state``.
-        save_per_protein_embeddings: Collect mean-pooled per-protein embeddings.
-        pad_multiple: Pad each batch's length dimension up to a multiple of
-            this. Set to 0 or 1 to disable.
-        desc: tqdm progress bar description.
-        progress_callback: Optional ``progress_callback(n)`` invoked after each
-            flushed batch. When provided, the internal tqdm bar is disabled —
-            used by the multi-GPU dispatcher to drive a single shared bar.
+        save_per_residue_embeddings / save_per_protein_embeddings: collect
+            ``last_hidden_state`` per residue and/or its per-protein mean.
+        pad_multiple: padded engine: round each batch's length up to this.
+        desc: progress bar description.
+        progress_callback: optional ``progress_callback(n_items)`` invoked
+            after each batch; when given, the internal bar is disabled.
+        engine: ``"padded"``, ``"packed"`` or ``"auto"`` (see the module
+            docstring for what auto picks on each kind of device).
+        compile: ``"auto"`` (compile on a GPU for inputs of at least
+            :func:`packed_min_residues` residues), ``"on"`` or ``"off"``. Experts can
+            name the mode: ``"full"`` / ``"flex"`` (packed), ``"dynamic"``
+            (padded under ``torch.compile(dynamic=True)``) or ``"none"``.
+        pack_tokens: packed engine: tokens per packed row.
 
     Returns:
         A :class:`ModernProstResult`.
     """
-    task = str(task).lower()
-    if task not in VALID_TASKS:
-        raise ValueError(f"task must be one of {VALID_TASKS}, got {task!r}")
-    is_pssm = task == PSSM_TASK
+    task = _check_task(task)
+    items = TokenisedItems.from_sequences(seq_dict, lut_from_tokenizer(tokenizer), chunk_len)
+    _log_chunking(items, chunk_len)
+    device = torch.device(device)
+    chosen, mode = _choose_engine(engine, compile, device, model, items.n_tokens)
+    pack_tokens = _fit_pack_tokens(items, chosen, pack_tokens)
+    store = _OutputStore(items, task, save_per_residue_embeddings or save_per_protein_embeddings,
+                         hidden_size=int(model.config.hidden_size))
+    batches = _plan(items, chosen, max_residues, pad_multiple, max_batch, pack_tokens, device,
+                    _score_cap(device, model))
+    runner = _make_runner(chosen, model, device, mode, pack_tokens, pad_multiple,
+                          n_encoders=1, want_hidden=store.want_hidden)
 
-    result = ModernProstResult()
-    want_embeddings = save_per_residue_embeddings or save_per_protein_embeddings
+    pbar = None
+    if progress_callback is None:
+        pbar = tqdm(total=items.n_items, desc=desc)
+        progress_callback = pbar.update
+    _report_empty(items, progress_callback)
+    try:
+        _drive(runner, items, iter(batches), store, progress_callback)
+    finally:
+        if pbar is not None:
+            pbar.close()
+    return store.finalise(output_probs, save_per_residue_embeddings, save_per_protein_embeddings)
 
-    # ── expand long sequences into chunks ───────────────────────────────────
-    # Chunk items carry a temporary "<id>__chunk<N>" key and are stitched back
-    # together after the loop. Chunk order within an id is recovered from N,
-    # not from batch completion order, so multi-GPU interleaving is safe.
-    items: List[Tuple[str, str, int]] = []
-    chunked_ids: set = set()
-    for seq_id, seq, _ in seq_dict:
-        seq = seq.replace("U", "X").replace("Z", "X").replace("O", "X")
-        if len(seq) > chunk_len:
-            chunked_ids.add(seq_id)
-            for ci, (_, subseq) in enumerate(chunk_sequence(seq, chunk_len)):
-                items.append((f"{seq_id}{_CHUNK_SEP}{ci}", subseq, len(subseq)))
-        else:
-            items.append((seq_id, seq, len(seq)))
 
-    if chunked_ids:
+def run_modernprost_inference_multi_gpu(
+    seq_dict: List[Tuple[str, str, int]],
+    devices: List[str],
+    model_dir: Path,
+    model_name: str,
+    half_precision: bool,
+    threads: int,
+    task: str = CLASSIFICATION_TASK,
+    check_fn: Optional[Callable] = None,
+    zenodo_fn: Optional[Callable] = None,
+    max_residues: Optional[int] = None,
+    max_seq_len: int = 30000,
+    max_batch: Optional[int] = None,
+    chunk_len: int = DEFAULT_CHUNK_LEN,
+    output_probs: bool = True,
+    save_per_residue_embeddings: bool = False,
+    save_per_protein_embeddings: bool = False,
+    pad_multiple: int = 8,
+    desc: str = "Predicting 3Di + 12st",
+    engine: str = "auto",
+    compile: str = "auto",
+    pack_tokens: int = DEFAULT_PACK_TOKENS,
+) -> ModernProstResult:
+    """Load the model on each device and run inference across all of them.
+
+    The input is tokenised and planned once; one worker per device then pulls
+    batches from a shared queue until it is empty, so a slower or busier GPU
+    simply takes fewer batches. Outputs go straight into one shared set of
+    buffers (batches write disjoint slices).
+
+    Workers are threads when nothing is compiled: model copies are loaded
+    **sequentially on the main thread** first (HuggingFace's
+    ``from_pretrained`` is not thread-safe; concurrent loads can leave a model
+    on the ``meta`` device). With ``torch.compile`` on several GPUs, workers
+    are processes instead: compilation is serialised inside one process
+    (~20-25 s per GPU on an A100, so four GPUs would spend ~90 s compiling
+    one after another), whereas separate processes compile in parallel. This
+    process drives the first device; spawned workers drive the others and
+    share the token and output buffers through shared memory.
+
+    With ``compile="auto"``, the compile threshold
+    (:func:`packed_min_residues`) applies to each device's share of the
+    input: every device compiles once but then processes only about
+    ``1 / len(devices)`` of the residues.
+
+    Args:
+        devices: device strings from :func:`pholdlib.prostt5.device.parse_gpus`.
+        model_dir / model_name / half_precision / threads / check_fn / zenodo_fn:
+            passed to :func:`get_modernprost_model`.
+        Everything else as in :func:`run_modernprost_inference`.
+
+    Returns:
+        A :class:`ModernProstResult`.
+
+    Raises:
+        ValueError: if ``devices`` is empty.
+        RuntimeError: if any input sequence is neither predicted nor recorded
+            as a failure — that would otherwise surface downstream as a
+            silently masked CDS.
+    """
+    if not devices:
+        raise ValueError("devices must contain at least one entry")
+
+    from pholdlib.modernprost.model import count_parameters, get_modernprost_model
+
+    task = _check_task(task)
+    t_start = time.perf_counter()
+
+    def load(dev: str, first: bool):
+        is_cpu = dev == "cpu"
+        # only the first load checks / downloads the checkpoint; the rest
+        # read the cache it left behind
+        return get_modernprost_model(
+            model_dir,
+            model_name,
+            cpu=is_cpu,
+            threads=threads,
+            check_fn=check_fn if first else None,
+            zenodo_fn=zenodo_fn if first else None,
+            device=None if is_cpu else dev,
+            half_precision=half_precision,
+        )
+
+    model0, tokenizer, device0 = load(devices[0], True)
+    logger.info(f"ModernProst total parameters: {count_parameters(model0):,}")
+
+    items = TokenisedItems.from_sequences(seq_dict, lut_from_tokenizer(tokenizer), chunk_len)
+    _log_chunking(items, chunk_len)
+    chosen, mode = _choose_engine(engine, compile, device0, model0, items.n_tokens,
+                                  n_devices=len(devices))
+    pack_tokens = _fit_pack_tokens(items, chosen, pack_tokens)
+    use_processes = (len(devices) > 1 and mode != "none"
+                     and all(str(d).startswith("cuda") for d in devices))
+    want_hidden = save_per_residue_embeddings or save_per_protein_embeddings
+    store = _OutputStore(items, task, want_hidden, hidden_size=int(model0.config.hidden_size),
+                         shared=use_processes)
+    batches = _plan(items, chosen, max_residues, pad_multiple, max_batch, pack_tokens, device0,
+                    _score_cap(device0, model0))
+    if len(devices) > 1:
         logger.info(
-            f"{len(chunked_ids)} sequence(s) longer than {chunk_len} residues "
-            f"were split into chunks for inference and reassembled afterwards."
+            f"Multi-GPU ModernProst inference across {len(devices)} device(s): {devices}. "
+            f"{len(seq_dict)} sequences in {len(batches)} {chosen} batches from a shared queue "
+            f"({'one process' if use_processes else 'one thread'} per device)."
         )
 
-    # Per-chunk stores, keyed by base id then chunk index.
-    chunk_store_3di: Dict[str, Dict[int, Tuple]] = {}
-    chunk_store_12st: Dict[str, Dict[int, Tuple]] = {}
-    chunk_profiles_3di: Dict[str, Dict[int, np.ndarray]] = {}
-    chunk_profiles_12st: Dict[str, Dict[int, np.ndarray]] = {}
-    chunk_emb_residue: Dict[str, Dict[int, np.ndarray]] = {}
+    pbar = tqdm(total=items.n_items, desc=desc)
+    lock = threading.Lock()
 
-    use_internal_bar = progress_callback is None
-    pbar = tqdm(total=len(items), desc=desc) if use_internal_bar else None
+    def on_batch(n: int) -> None:
+        with lock:
+            pbar.update(n)
 
-    batch: List[Tuple[str, str, int]] = []
-    n_res_batch = 0
-
-    for idx, (item_id, seq, slen) in enumerate(items, 1):
-        batch.append((item_id, seq, slen))
-        n_res_batch += slen
-
-        flush = (
-            len(batch) >= max_batch
-            or n_res_batch >= max_residues
-            or idx == len(items)
-            or slen > max_seq_len
-        )
-        if not flush:
-            continue
-
-        item_ids, seqs, seq_lens = zip(*batch)
-        batch_n = len(batch)
-        batch = []
-        batch_residues = n_res_batch
-        n_res_batch = 0
-
-        try:
-            logits_3di, logits_12st, hidden = _forward_batch(
-                model, tokenizer, device, seqs, pad_multiple, want_embeddings
-            )
-        except RuntimeError as exc:
-            logger.warning(
-                f"RuntimeError during ModernProst inference — batch residues: "
-                f"{batch_residues}, batch size: {batch_n}, ids: {item_ids} ({exc})"
-            )
-            result.fail_ids.extend(_base_ids(item_ids))
-            _tick(pbar, progress_callback, batch_n)
-            continue
-
-        try:
-            if is_pssm:
-                profiles_3di = toCPU(torch.softmax(logits_3di.float(), dim=-1))
-                profiles_12st = toCPU(torch.softmax(logits_12st.float(), dim=-1))
-            else:
-                preds_3di = toCPU(torch.argmax(logits_3di, dim=-1)).astype(np.byte)
-                preds_12st = toCPU(torch.argmax(logits_12st, dim=-1)).astype(np.byte)
-                # .float() before toCPU — numpy has no bfloat16 dtype, and fp16
-                # means would accumulate visible error over a long protein.
-                probs_3di = toCPU(
-                    torch.softmax(logits_3di.float(), dim=-1).max(dim=-1).values
-                )
-                probs_12st = toCPU(
-                    torch.softmax(logits_12st.float(), dim=-1).max(dim=-1).values
-                )
-
-            for i, item_id in enumerate(item_ids):
-                L = seq_lens[i]
-                base_id, chunk_idx = _split_chunk_id(item_id)
-
-                if want_embeddings:
-                    _store_embeddings(
-                        result,
-                        chunk_emb_residue,
-                        hidden,
-                        i,
-                        L,
-                        base_id,
-                        chunk_idx,
-                        save_per_residue_embeddings,
-                        save_per_protein_embeddings,
-                    )
-
-                if is_pssm:
-                    prof_3di = profiles_3di[i, :L, :]
-                    prof_12st = profiles_12st[i, :L, :]
-                    if chunk_idx is None:
-                        result.profiles_3di[base_id] = prof_3di
-                        result.profiles_12st[base_id] = prof_12st
-                    else:
-                        chunk_profiles_3di.setdefault(base_id, {})[chunk_idx] = prof_3di
-                        chunk_profiles_12st.setdefault(base_id, {})[chunk_idx] = prof_12st
-                    continue
-
-                p3, pr3 = preds_3di[i, :L], probs_3di[i, :L]
-                p12, pr12 = preds_12st[i, :L], probs_12st[i, :L]
-
-                if chunk_idx is None:
-                    result.predictions_3di[base_id] = _finalise(p3, pr3, output_probs)
-                    result.predictions_12st[base_id] = _finalise(p12, pr12, output_probs)
-                else:
-                    # Per-chunk means are meaningless; the mean is recomputed
-                    # from the concatenated full-length arrays after the loop.
-                    chunk_store_3di.setdefault(base_id, {})[chunk_idx] = (p3, pr3)
-                    chunk_store_12st.setdefault(base_id, {})[chunk_idx] = (p12, pr12)
-
-        except IndexError as exc:
-            logger.warning(
-                f"IndexError while decoding ModernProst output for {item_ids} ({exc})"
-            )
-            result.fail_ids.extend(_base_ids(item_ids))
-
-        _tick(pbar, progress_callback, batch_n)
-
-    if pbar is not None:
+    _report_empty(items, on_batch)
+    # warm-up and workers change the CUDA current device; give the caller its
+    # own back afterwards
+    restore = torch.cuda.current_device() if torch.cuda.is_available() else None
+    try:
+        if use_processes:
+            worker_args = dict(model_dir=model_dir, model_name=model_name,
+                               half_precision=half_precision,
+                               threads=max(1, threads // len(devices)), task=task, engine=chosen,
+                               mode=mode, pack_tokens=pack_tokens, pad_multiple=pad_multiple,
+                               want_hidden=want_hidden)
+            t_run = _run_with_processes(model0, device0, devices, items, store, batches,
+                                        worker_args, on_batch)
+        else:
+            loaded = [(model0, device0)] + [load(dev, False)[0::2] for dev in devices[1:]]
+            logger.info(f"Loaded {len(loaded)} ModernProst model cop{'y' if len(loaded) == 1 else 'ies'} "
+                        f"in {time.perf_counter() - t_start:.1f} s")
+            t_run = _run_with_threads(loaded, items, store, batches, chosen, mode, pack_tokens,
+                                      pad_multiple, on_batch)
+    finally:
         pbar.close()
+        if restore is not None:
+            torch.cuda.set_device(restore)
+    t_done = time.perf_counter()
+    result = store.finalise(output_probs, save_per_residue_embeddings, save_per_protein_embeddings)
+    logger.info(
+        f"ModernProst: {items.n_tokens:,} residues on {len(devices)} device(s) in "
+        f"{time.perf_counter() - t_start:.1f} s (main inference phase {t_done - t_run:.1f} s, "
+        f"result assembly {time.perf_counter() - t_done:.1f} s)"
+    )
 
-    # ── stitch chunked sequences back together ──────────────────────────────
-    _concat_prediction_chunks(chunk_store_3di, result.predictions_3di, output_probs)
-    _concat_prediction_chunks(chunk_store_12st, result.predictions_12st, output_probs)
-    _concat_profile_chunks(chunk_profiles_3di, result.profiles_3di)
-    _concat_profile_chunks(chunk_profiles_12st, result.profiles_12st)
-
-    if save_per_residue_embeddings:
-        for base_id, chunks in chunk_emb_residue.items():
-            result.embeddings_per_residue[base_id] = np.concatenate(
-                [chunks[ci] for ci in sorted(chunks)], axis=0
-            )
-    if save_per_protein_embeddings:
-        # A chunked protein's mean must be recomputed over the whole sequence;
-        # averaging per-chunk means would weight short chunks too heavily.
-        for base_id, chunks in chunk_emb_residue.items():
-            full = np.concatenate([chunks[ci] for ci in sorted(chunks)], axis=0)
-            result.embeddings_per_protein[base_id] = full.mean(axis=0)
-
-    # De-duplicate fail ids: a chunked protein can fail in more than one batch.
-    result.fail_ids = list(dict.fromkeys(result.fail_ids))
-
+    # Every input seq_id must appear either as a prediction/profile or in
+    # fail_ids. A silent drop would make downstream code mask the CDS as
+    # "XXXX…" with no explanation of why.
+    accounted = set(result.predictions_3di) | set(result.profiles_3di) | set(result.fail_ids)
+    dropped = {sid for sid, _, _ in seq_dict} - accounted
+    if dropped:
+        raise RuntimeError(
+            f"ModernProst inference dropped {len(dropped)} sequence(s) without recording "
+            f"them in fail_ids — likely a bug in batch error handling. "
+            f"First few: {sorted(dropped)[:10]}"
+        )
     return result
 
 
+def _run_with_threads(loaded, items, store, batches, engine, mode, pack_tokens, pad_multiple,
+                      on_batch) -> float:
+    """Drive every loaded (model, device) from one shared queue, one thread
+    per device. Returns the time the main phase started."""
+    queue = _BatchQueue(batches)
+    runners = []
+    for model, dev in loaded:
+        _set_device(dev)
+        runner = _make_runner(engine, model, dev, mode, pack_tokens, pad_multiple,
+                              n_encoders=len(loaded), want_hidden=store.want_hidden)
+        # A compiled engine compiles on its first batches: do that here, one
+        # device at a time, on real batches. The longest and the shortest
+        # batch bracket every shape a dynamic-shape (padded) graph will see.
+        if runner.compiled:
+            t_warm = time.perf_counter()
+            _drive(runner, items, queue.take_extremes(), store, on_batch)
+            logger.info(f"Compiled ModernProst on {dev} in {time.perf_counter() - t_warm:.1f} s "
+                        f"(first two batches included)")
+        runners.append(runner)
+    t_run = time.perf_counter()
+
+    if len(runners) == 1:
+        _drive(runners[0], items, queue.iterate(), store, on_batch)
+    else:
+        def work(runner):
+            _set_device(runner.device)
+            _drive(runner, items, queue.iterate(), store, on_batch)
+
+        with ThreadPoolExecutor(max_workers=len(runners)) as pool:
+            for fut in [pool.submit(work, r) for r in runners]:
+                fut.result()
+    return t_run
+
+
+def _run_with_processes(model0, device0, devices, items: TokenisedItems, store: "_OutputStore",
+                        batches: List[np.ndarray], worker_args: dict, on_batch) -> float:
+    """Drive ``devices[0]`` here and every other device from a spawned worker
+    process, all pulling from one shared batch counter. Returns the time the
+    main phase started."""
+    import torch.multiprocessing as tmp
+
+    ctx = tmp.get_context("spawn")
+    counter = ctx.Value("q", 0, lock=False)
+    counter_lock = ctx.Lock()
+    msgs = ctx.Queue()
+    shared_items = {
+        "tokens": torch.from_numpy(items.tokens).share_memory_(),
+        "offsets": torch.from_numpy(items.offsets).share_memory_(),
+        "lengths": torch.from_numpy(items.lengths).share_memory_(),
+        "item_protein": torch.from_numpy(items.item_protein).share_memory_(),
+    }
+    procs = []
+    for rank, dev in enumerate(devices[1:], start=1):
+        p = ctx.Process(
+            target=_process_worker,
+            args=(rank, str(dev), worker_args, shared_items, store.tensors, batches,
+                  counter, counter_lock, msgs),
+            daemon=True,
+        )
+        p.start()
+        procs.append(p)
+
+    finished: Dict[int, tuple] = {}
+
+    def listen():
+        while len(finished) < len(procs):
+            try:
+                msg = msgs.get(timeout=1.0)
+            except queue_mod.Empty:
+                if not any(p.is_alive() for p in procs):
+                    break
+                continue
+            kind = msg[0]
+            if kind == "progress":
+                on_batch(msg[1])
+            elif kind == "log":
+                logger.log(msg[1], msg[2])
+            else:  # "done" / "error"
+                finished[msg[1]] = msg
+
+    listener = threading.Thread(target=listen, daemon=True)
+    listener.start()
+
+    t_run = time.perf_counter()
+    _set_device(device0)
+    runner = _make_runner(worker_args["engine"], model0, device0, worker_args["mode"],
+                          worker_args["pack_tokens"], worker_args["pad_multiple"], n_encoders=1,
+                          want_hidden=worker_args["want_hidden"])
+    _drive(runner, items, _SharedBatchQueue(batches, counter, counter_lock).iterate(), store, on_batch)
+
+    for p in procs:
+        p.join()
+    listener.join()
+    for rank, p in enumerate(procs, start=1):
+        msg = finished.get(rank)
+        if msg is None:
+            logger.warning(f"ModernProst worker for {devices[rank]} exited with code {p.exitcode} "
+                           "without reporting; its unfinished batches are rerun here.")
+        elif msg[0] == "error":
+            logger.warning(f"ModernProst worker for {devices[rank]} failed; its unfinished batches "
+                           f"are rerun here:\n{msg[2]}")
+        else:
+            for b in msg[2]:
+                store.fail(b)
+
+    # a worker that died mid-batch leaves items neither written nor failed
+    leftover = store.unfinished()
+    if len(leftover):
+        logger.warning(f"Rerunning {len(leftover)} unfinished item(s) on {device0}.")
+        if worker_args["engine"] == "packed":
+            sub = plan_packed_batches(items.lengths[leftover], worker_args["pack_tokens"])
+        else:
+            sub = plan_padded_batches(items.lengths[leftover], DEFAULT_TOKEN_BUDGET,
+                                      worker_args["pad_multiple"])
+        _drive(runner, items, iter([leftover[b] for b in sub]), store, on_batch)
+    return t_run
+
+
+class _SharedBatchQueue:
+    """The plan plus a 'next batch' counter shared between processes."""
+
+    def __init__(self, batches: List[np.ndarray], counter, lock):
+        self._batches = batches
+        self._counter = counter
+        self._lock = lock
+
+    def iterate(self) -> Iterator[np.ndarray]:
+        while True:
+            with self._lock:
+                k = self._counter.value
+                self._counter.value = k + 1
+            if k >= len(self._batches):
+                return
+            yield self._batches[k]
+
+
+def _process_worker(rank: int, device: str, args: dict, shared_items: dict, shared_out: dict,
+                    batches: List[np.ndarray], counter, counter_lock, msgs) -> None:
+    """Spawned worker: load the model on ``device``, then pull batches from the
+    shared counter and write outputs into the shared buffers. Warnings are
+    forwarded to the parent's log; nothing large travels through ``msgs``."""
+    logger.remove()
+    logger.add(lambda m: msgs.put(("log", m.record["level"].name, f"[{device}] {m.record['message']}")),
+               level="WARNING")
+    try:
+        from pholdlib.modernprost.model import get_modernprost_model
+
+        torch.cuda.set_device(device)
+        model, _, dev = get_modernprost_model(
+            Path(args["model_dir"]), args["model_name"], cpu=False, threads=args["threads"],
+            device=device, half_precision=args["half_precision"],
+        )
+        n = {k: v.numpy() for k, v in shared_items.items()}
+        items = TokenisedItems(seq_ids=[], item_protein=n["item_protein"], lengths=n["lengths"],
+                               offsets=n["offsets"], tokens=n["tokens"],
+                               protein_offsets=np.zeros(1, dtype=np.int64), n_chunked=0)
+        store = _OutputStore.attach(items, args["task"], args["want_hidden"], shared_out)
+        runner = _make_runner(args["engine"], model, dev, args["mode"], args["pack_tokens"],
+                              args["pad_multiple"], n_encoders=1, want_hidden=args["want_hidden"])
+        _drive(runner, items, _SharedBatchQueue(batches, counter, counter_lock).iterate(), store,
+               lambda k: msgs.put(("progress", k)))
+        msgs.put(("done", rank, store.failed_items))
+    except BaseException:  # noqa: BLE001 - report everything to the parent
+        msgs.put(("error", rank, traceback.format_exc()))
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Internal helpers
+# Engine selection and planning
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _forward_batch(
-    model,
-    tokenizer,
-    device: torch.device,
-    seqs: Tuple[str, ...],
-    pad_multiple: int,
-    want_hidden: bool,
-):
-    """Tokenise, pad, and run one forward pass.
+def _check_task(task: str) -> str:
+    task = str(task).lower()
+    if task not in VALID_TASKS:
+        raise ValueError(f"task must be one of {VALID_TASKS}, got {task!r}")
+    return task
 
-    Returns ``(logits_3di, logits_12st, last_hidden_state_or_None)``, all still
-    on ``device``.
+
+def _log_chunking(items: TokenisedItems, chunk_len: int) -> None:
+    if items.n_chunked:
+        logger.info(
+            f"{items.n_chunked} sequence(s) longer than {chunk_len} residues "
+            f"were split into chunks for inference and reassembled afterwards."
+        )
+
+
+def packed_min_residues(model=None) -> int:
+    """Residues per device from which ``compile="auto"`` compiles (and
+    ``engine="auto"`` may pack): ``PHOLDLIB_PACKED_MIN_RESIDUES`` if set,
+    else 20M for the ~50M-parameter checkpoints and 5M for the ~1B ones,
+    doubled on ROCm."""
+    env = os.environ.get("PHOLDLIB_PACKED_MIN_RESIDUES")
+    if env:
+        try:
+            return int(env)
+        except ValueError:
+            logger.warning(f"Ignoring non-integer PHOLDLIB_PACKED_MIN_RESIDUES={env!r}")
+    try:
+        n_params = sum(p.numel() for p in model.parameters())
+    except (AttributeError, TypeError):
+        n_params = 0
+    base = PACKED_MIN_RESIDUES_LARGE_MODEL if n_params >= _LARGE_MODEL_PARAMS else PACKED_MIN_RESIDUES
+    return base * _ROCM_THRESHOLD_FACTOR if is_rocm() else base
+
+
+COMPILE_MODES = ("auto", "on", "off", "full", "flex", "dynamic", "none")
+
+
+def is_rocm() -> bool:
+    """True on a ROCm build of PyTorch (never infer this from compute
+    capability: ROCm reports (9, 0) on MI250X, the same as an H100)."""
+    return getattr(torch.version, "hip", None) is not None
+
+
+def _choose_engine(engine: str, compile: str, device: torch.device, model,
+                   n_tokens: int, n_devices: int = 1) -> Tuple[str, str]:
+    """Resolve the user's ``engine`` / ``compile`` request to a concrete
+    ``(engine, compile_mode)``.
+
+    compile modes: ``"full"`` / ``"flex"`` (packed engine), ``"dynamic"``
+    (padded engine under ``torch.compile(dynamic=True)``) and ``"none"``.
+    ``"on"`` means full for packed and dynamic for padded; ``"off"`` = none;
+    ``"auto"`` compiles only on a GPU and only when each of the
+    ``n_devices`` devices gets at least :func:`packed_min_residues`
+    residues (which depends on model size): every device pays for
+    compiling, but only its own share of the input pays it back.
     """
-    inputs = tokenizer(
-        list(seqs),
-        add_special_tokens=False,
-        padding="longest",
-        truncation=False,
-        return_tensors="pt",
-    )
-    # ModernProst has no token_type embedding; a stray key would be forwarded
-    # into the model as **kwargs and silently ignored, but drop it explicitly.
-    inputs.pop("token_type_ids", None)
+    engine = str(engine).lower()
+    compile = str(compile).lower() if compile is not None else "auto"
+    if engine not in ENGINES:
+        raise ValueError(f"engine must be one of {ENGINES}, got {engine!r}")
+    if compile not in COMPILE_MODES:
+        raise ValueError(f"compile must be one of {COMPILE_MODES}, got {compile!r}")
 
-    if pad_multiple and pad_multiple > 1:
-        cur_len = inputs["input_ids"].shape[1]
-        pad_to = ((cur_len + pad_multiple - 1) // pad_multiple) * pad_multiple
-        if pad_to != cur_len:
-            extra = pad_to - cur_len
-            inputs["input_ids"] = F.pad(
-                inputs["input_ids"], (0, extra), value=tokenizer.pad_token_id
+    on_gpu = torch.device(device).type == "cuda"
+    threshold = packed_min_residues(model)
+    n_devices = max(1, int(n_devices))
+    per_device = n_tokens / n_devices
+    large = per_device >= threshold
+    want_compile = compile in ("on", "full", "flex", "dynamic") or (compile == "auto" and on_gpu and large)
+
+    from pholdlib.modernprost.packed import packed_engine_status
+
+    packed_ok, why = packed_engine_status(device, model)
+    if engine == "auto":
+        # packed only where its Triton attention is fast (NVIDIA); on ROCm the
+        # padded engine under torch.compile is faster (measured on MI250X)
+        engine = "packed" if (want_compile and packed_ok and not is_rocm()) else "padded"
+    if engine == "packed" and not packed_ok:
+        logger.warning(f"Packed ModernProst engine unavailable ({why}); using the padded engine.")
+        engine = "padded"
+
+    mode = "none"
+    if engine == "packed":
+        mode = compile if compile in ("full", "flex", "none") else ("none" if compile == "off" else "full")
+        if mode == "none" and on_gpu:
+            # uncompiled FlexAttention falls back to a dense reference
+            # implementation: a (pack_tokens x pack_tokens) score matrix
+            logger.warning("The packed ModernProst engine needs torch.compile on a GPU; "
+                           "using the eager padded engine.")
+            engine, want_compile = "padded", False
+    if engine == "padded":
+        # "full"/"flex" name packed modes; the padded equivalent is dynamic
+        mode = "dynamic" if want_compile else "none"
+    if compile == "auto" and on_gpu:
+        share = (f"{n_tokens:,} residues" if n_devices == 1 else
+                 f"{n_tokens:,} residues over {n_devices} devices ({per_device:,.0f} each)")
+        if mode != "none" and large:
+            logger.info(
+                f"{share} >= {threshold:,}: using the {engine} ModernProst engine "
+                f"with torch.compile ({mode}); the first batch compiles, then it runs faster."
             )
-            inputs["attention_mask"] = F.pad(inputs["attention_mask"], (0, extra), value=0)
+        elif mode == "none" and n_tokens >= threshold:
+            logger.info(
+                f"{share}, below {threshold:,} per device: using the eager {engine} ModernProst "
+                f"engine, because compiling on every device would cost more than it saves "
+                f"(compile='on' compiles anyway)."
+            )
+    return engine, mode
 
-    input_ids = inputs["input_ids"].to(device, non_blocking=True)
-    attention_mask = inputs["attention_mask"].to(device, non_blocking=True)
 
-    with torch.inference_mode():
-        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+def _fit_pack_tokens(items: TokenisedItems, engine: str, pack_tokens: int) -> int:
+    """Packed rows must hold the longest item; grow them (to a multiple of
+    the FlexAttention tile) when ``chunk_len`` exceeds ``pack_tokens``."""
+    if engine != "packed" or not items.n_items:
+        return pack_tokens
+    from pholdlib.modernprost.packed import DEFAULT_BLOCK
 
-    logits = outputs.logits
-    hidden = outputs.last_hidden_state if want_hidden else None
-    return logits["3di"], logits["12st"], hidden
+    longest = int(items.lengths.max())
+    if longest <= pack_tokens:
+        return pack_tokens
+    fitted = -(-longest // DEFAULT_BLOCK) * DEFAULT_BLOCK
+    logger.info(f"Longest item is {longest} residues; packing {fitted} tokens per row instead of {pack_tokens}.")
+    return fitted
 
+
+def _score_cap(device: torch.device, model) -> Optional[int]:
+    """Per-head attention-score cap for padded batches on devices without
+    memory-efficient attention (see MATERIALISED_SCORE_BUDGET)."""
+    if torch.device(device).type == "cuda":
+        return None
+    heads = int(getattr(model.config, "num_attention_heads", 1) or 1)
+    return MATERIALISED_SCORE_BUDGET // heads
+
+
+def default_token_budget(device) -> int:
+    """Padded-engine token budget used when ``max_residues`` is None."""
+    if torch.device(device).type == "cuda":
+        return DEFAULT_TOKEN_BUDGET
+    return DEFAULT_TOKEN_BUDGET_NO_FUSED_ATTENTION
+
+
+def _plan(items: TokenisedItems, engine: str, max_residues: Optional[int], pad_multiple: int,
+          max_batch: Optional[int], pack_tokens: int, device,
+          max_scores: Optional[int] = None) -> List[np.ndarray]:
+    """Batches of item indices; zero-length items are never sent to the model."""
+    lengths = items.lengths
+    nonempty = np.flatnonzero(lengths > 0)
+    if engine == "packed":
+        sub = plan_packed_batches(lengths[nonempty], pack_tokens)
+    else:
+        budget = max_residues if max_residues and max_residues > 0 else default_token_budget(device)
+        sub = plan_padded_batches(lengths[nonempty], budget, pad_multiple, max_batch, max_scores)
+    return [nonempty[b] for b in sub]
+
+
+class _BatchQueue:
+    """Thread-safe queue over a fixed plan, consumed from the front (plus a
+    warm-up helper that takes one batch from each end)."""
+
+    def __init__(self, batches: List[np.ndarray]):
+        self._batches = batches
+        self._next = 0
+        self._end = len(batches)
+        self._lock = threading.Lock()
+
+    def _pop(self, back: bool = False) -> Optional[np.ndarray]:
+        with self._lock:
+            if self._next >= self._end:
+                return None
+            if back:
+                self._end -= 1
+                return self._batches[self._end]
+            b = self._batches[self._next]
+            self._next += 1
+            return b
+
+    def take_extremes(self) -> Iterator[np.ndarray]:
+        for back in (False, True):
+            b = self._pop(back)
+            if b is None:
+                return
+            yield b
+
+    def iterate(self) -> Iterator[np.ndarray]:
+        while True:
+            b = self._pop()
+            if b is None:
+                return
+            yield b
+
+
+
+def _report_empty(items: TokenisedItems, progress: Callable[[int], None]) -> None:
+    """Zero-length items are never batched; count them as done up front."""
+    n_empty = int((items.lengths == 0).sum())
+    if n_empty:
+        progress(n_empty)
+
+
+def _set_device(device: torch.device) -> None:
+    # Each worker thread must target its own GPU: CUDA's "current device" is
+    # per thread and defaults to cuda:0, and events/streams created without an
+    # explicit device follow it.
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Runners: launch one batch, return device tensors for its real tokens
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _PaddedRunner:
+    """One protein per row, through the checkpoint's own forward."""
+
+    def __init__(self, model, device: torch.device, pad_multiple: int, compile: str,
+                 want_hidden: bool):
+        self.device = device
+        self.pad_multiple = pad_multiple
+        self.compiled = compile == "dynamic"
+        self.forward = torch.compile(model, dynamic=True) if self.compiled else model
+        self.pin = device.type == "cuda"
+        self.want_hidden = want_hidden
+
+    def launch(self, items: TokenisedItems, batch: np.ndarray):
+        lens = items.lengths[batch]
+        B = len(batch)
+        Lp = int(lens.max())
+        if self.pad_multiple and self.pad_multiple > 1:
+            Lp = ((Lp + self.pad_multiple - 1) // self.pad_multiple) * self.pad_multiple
+        arr = np.zeros((B, Lp), dtype=np.uint8)
+        toks, offs = items.tokens, items.offsets
+        for r, idx in enumerate(batch):
+            o, L = int(offs[idx]), int(items.lengths[idx])
+            arr[r, :L] = toks[o:o + L]
+        starts = np.zeros(B, dtype=np.int64)
+        if B > 1:
+            np.cumsum(lens[:-1], out=starts[1:])
+        n_real = int(lens.sum())
+        # flat (row * Lp + col) index of every real token, in batch order;
+        # gathering with it needs no device sync, unlike boolean-mask indexing
+        sel = np.repeat(np.arange(B, dtype=np.int64) * Lp - starts, lens) + np.arange(n_real, dtype=np.int64)
+
+        ids = _to_device(arr, self.device, self.pin).long()
+        sel_g = _to_device(sel, self.device, self.pin)
+        mask = ids != 0  # <pad> is id 0; every residue, even unknown, is >= 2
+        with torch.inference_mode():
+            out = self.forward(input_ids=ids, attention_mask=mask)
+            l3 = out.logits["3di"].reshape(B * Lp, -1).index_select(0, sel_g)
+            l12 = out.logits["12st"].reshape(B * Lp, -1).index_select(0, sel_g)
+            hid = None
+            if self.want_hidden:
+                hid = out.last_hidden_state.reshape(B * Lp, -1).index_select(0, sel_g)
+        return l3, l12, hid
+
+
+class _PackedRunner:
+    """Packed rows through :class:`pholdlib.modernprost.packed.PackedEncoder`."""
+
+    def __init__(self, model, device: torch.device, mode: str, pack_tokens: int, n_encoders: int):
+        from pholdlib.modernprost.packed import PackedEncoder
+
+        self.encoder = PackedEncoder(model, device, capacity=pack_tokens, compile=mode,
+                                     n_encoders=n_encoders)
+        self.device = device
+        self.compiled = mode in ("full", "flex")
+
+    def launch(self, items: TokenisedItems, batch: np.ndarray):
+        l3, l12, hid, n_real = self.encoder.run_batch(items, batch)
+        return l3[:n_real], l12[:n_real], hid[:n_real]
+
+
+class _FallbackRunner:
+    """A compiled runner that permanently drops to the eager padded engine if
+    a batch fails for any reason other than running out of memory — typically
+    a torch.compile / Triton failure on an unsupported stack (for example a
+    conda Triton that cannot find ``ptxas`` because the env is not
+    activated). Without this, every batch would fail and every protein would
+    land in ``fail_ids``."""
+
+    def __init__(self, primary, make_fallback: Callable[[], "_PaddedRunner"]):
+        self.primary = primary
+        self.make_fallback = make_fallback
+        self.device = primary.device
+        self.compiled = True
+        self._fell_back = False
+
+    def launch(self, items: TokenisedItems, batch: np.ndarray):
+        if self._fell_back:
+            return self.primary.launch(items, batch)
+        try:
+            return self.primary.launch(items, batch)
+        except Exception as exc:  # noqa: BLE001
+            if _is_oom(exc):
+                raise
+            logger.warning(
+                f"Compiled ModernProst engine failed on {self.device} ({type(exc).__name__}: "
+                f"{str(exc)[:300]}); switching this device to the eager padded engine."
+            )
+            self.primary = self.make_fallback()
+            self.compiled = False
+            self._fell_back = True
+            return self.primary.launch(items, batch)
+
+
+def _make_runner(engine: str, model, device: torch.device, mode: str, pack_tokens: int,
+                 pad_multiple: int, n_encoders: int, want_hidden: bool):
+    """Runner for the resolved ``(engine, mode)``. Compiled runners are
+    wrapped so a compile failure on the first batch drops that device to the
+    eager padded engine instead of failing every batch."""
+    def eager_padded():
+        return _PaddedRunner(model, device, pad_multiple, "none", want_hidden)
+
+    if engine == "packed":
+        try:
+            primary = _PackedRunner(model, device, mode, pack_tokens, n_encoders)
+        except Exception as exc:  # noqa: BLE001 - any setup failure falls back
+            logger.warning(f"Packed ModernProst engine failed to start ({exc}); using the padded engine.")
+            primary = eager_padded()
+    else:
+        primary = _PaddedRunner(model, device, pad_multiple, mode, want_hidden)
+    runner = _FallbackRunner(primary, eager_padded) if primary.compiled else primary
+    # used by _drive to retry a batch that ran out of memory
+    runner.make_eager_padded = eager_padded
+    return runner
+
+
+def _to_device(a: np.ndarray, device: torch.device, pin: bool) -> torch.Tensor:
+    t = torch.from_numpy(a)
+    if pin:
+        return t.pin_memory().to(device, non_blocking=True)
+    return t.to(device)
+
+
+def _is_oom(exc: BaseException) -> bool:
+    # CUDA/ROCm raise torch.OutOfMemoryError; MPS raises a plain RuntimeError
+    # ("MPS backend out of memory")
+    if hasattr(torch, "OutOfMemoryError") and isinstance(exc, torch.OutOfMemoryError):
+        return True
+    return "out of memory" in str(exc).lower()
+
+
+def _free_memory(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    elif device.type == "mps" and hasattr(torch, "mps"):
+        torch.mps.empty_cache()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Driving batches and collecting outputs
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _OutputStore:
+    """Per-token output buffers for every item, laid out like ``items.tokens``.
+
+    A protein's chunks are consecutive items, so every protein's outputs are
+    one contiguous slice ``[protein_offsets[p], protein_offsets[p + 1])`` and
+    stitching chunks needs no extra work. Batches only ever write disjoint
+    slices, so several worker threads can fill the same store.
+    """
+
+    def __init__(self, items: TokenisedItems, task: str, want_hidden: bool, hidden_size: int,
+                 shared: bool = False):
+        n = items.n_tokens
+        if task == PSSM_TASK:
+            spec = {"P3": ((n, 20), torch.float32), "P12": ((n, 12), torch.float32)}
+        else:
+            spec = {"p3": ((n,), torch.int8), "p12": ((n,), torch.int8),
+                    "q3": ((n,), torch.float32), "q12": ((n,), torch.float32)}
+        if want_hidden:
+            spec["H"] = ((n, hidden_size), torch.float32)
+        # per-item completion flag (zero-length items never reach the model)
+        spec["done"] = ((items.n_items,), torch.uint8)
+        # torch tensors so they can live in shared memory for worker processes
+        self.tensors = {k: torch.zeros(shape, dtype=dt) for k, (shape, dt) in spec.items()}
+        self.tensors["done"][torch.from_numpy(items.lengths == 0)] = 1
+        if shared:
+            for t in self.tensors.values():
+                t.share_memory_()
+        self._init(items, task, want_hidden)
+
+    def _init(self, items: TokenisedItems, task: str, want_hidden: bool) -> None:
+        self.items = items
+        self.task = task
+        self.want_hidden = want_hidden
+        self.arrays = {k: t.numpy() for k, t in self.tensors.items() if k != "done"}
+        self.done = self.tensors["done"].numpy()
+        self.failed_items: List[np.ndarray] = []
+        self._fail_lock = threading.Lock()
+
+    @classmethod
+    def attach(cls, items: TokenisedItems, task: str, want_hidden: bool,
+               tensors: Dict[str, torch.Tensor]) -> "_OutputStore":
+        """A store over another process's shared buffers."""
+        store = cls.__new__(cls)
+        store.tensors = tensors
+        store._init(items, task, want_hidden)
+        return store
+
+    def device_outputs(self, l3, l12, hid) -> Dict[str, torch.Tensor]:
+        """Reduce logits on the device to exactly what is copied back."""
+        if self.task == PSSM_TASK:
+            out = {"P3": torch.softmax(l3.float(), dim=-1), "P12": torch.softmax(l12.float(), dim=-1)}
+        else:
+            # .float() before softmax: numpy has no bfloat16, and fp16 means
+            # would accumulate visible error over a long protein.
+            q3, p3 = torch.softmax(l3.float(), dim=-1).max(dim=-1)
+            q12, p12 = torch.softmax(l12.float(), dim=-1).max(dim=-1)
+            out = {"p3": p3.to(torch.int8), "p12": p12.to(torch.int8), "q3": q3, "q12": q12}
+        if self.want_hidden:
+            out["H"] = hid.float()
+        return out
+
+    def write(self, batch: np.ndarray, host: Dict[str, np.ndarray]) -> None:
+        offs, lens = self.items.offsets, self.items.lengths
+        lo = 0
+        for idx in batch:
+            o, L = int(offs[idx]), int(lens[idx])
+            for k, arr in self.arrays.items():
+                arr[o:o + L] = host[k][lo:lo + L]
+            lo += L
+        self.done[batch] = 1
+
+    def unfinished(self) -> np.ndarray:
+        """Items neither written nor recorded as failed."""
+        failed = np.zeros(len(self.done), dtype=bool)
+        for b in self.failed_items:
+            failed[b] = True
+        return np.flatnonzero((self.done == 0) & ~failed)
+
+    def fail(self, batch: np.ndarray) -> None:
+        with self._fail_lock:
+            self.failed_items.append(np.asarray(batch))
+
+    def finalise(self, output_probs: bool, per_residue: bool, per_protein: bool) -> ModernProstResult:
+        items = self.items
+        result = ModernProstResult()
+        failed = np.zeros(len(items.seq_ids), dtype=bool)
+        for b in self.failed_items:
+            failed[items.item_protein[b]] = True
+        po = items.protein_offsets
+        a = self.arrays
+        if self.task != PSSM_TASK:
+            # per-protein mean confidence in one vectorised pass
+            means3 = _segment_means(a["q3"], po)
+            means12 = _segment_means(a["q12"], po)
+        if per_protein:
+            emb_means = _segment_means(a["H"], po)
+        for p, seq_id in enumerate(items.seq_ids):
+            if failed[p]:
+                result.fail_ids.append(seq_id)
+                continue
+            s, e = int(po[p]), int(po[p + 1])
+            if self.task == PSSM_TASK:
+                result.profiles_3di[seq_id] = a["P3"][s:e]
+                result.profiles_12st[seq_id] = a["P12"][s:e]
+            else:
+                result.predictions_3di[seq_id] = (
+                    a["p3"][s:e], round(100 * float(means3[p]), 2), a["q3"][s:e] if output_probs else None)
+                result.predictions_12st[seq_id] = (
+                    a["p12"][s:e], round(100 * float(means12[p]), 2), a["q12"][s:e] if output_probs else None)
+            if per_residue:
+                result.embeddings_per_residue[seq_id] = a["H"][s:e]
+            if per_protein:
+                result.embeddings_per_protein[seq_id] = emb_means[p].astype(np.float32)
+        return result
+
+
+def _segment_means(values: np.ndarray, offsets: np.ndarray) -> np.ndarray:
+    """Mean of ``values[offsets[i]:offsets[i+1]]`` along axis 0 for every i.
+
+    Accumulates in float64; empty segments give 0.
+    """
+    n = len(offsets) - 1
+    out_shape = (n,) + values.shape[1:]
+    sums = np.zeros(out_shape, dtype=np.float64)
+    counts = np.diff(offsets)
+    nonempty = counts > 0
+    if values.shape[0] and nonempty.any():
+        sums[nonempty] = np.add.reduceat(values, offsets[:-1][nonempty], axis=0, dtype=np.float64)
+    return sums / np.maximum(counts, 1).reshape((-1,) + (1,) * (values.ndim - 1))
+
+
+class _HostCopy:
+    """Device -> host copy of one batch's outputs, asynchronous on CUDA."""
+
+    def __init__(self, gpu: Dict[str, torch.Tensor]):
+        dev = next(iter(gpu.values())).device
+        self.event = None
+        if dev.type == "cuda":
+            self.host = {}
+            for k, v in gpu.items():
+                h = torch.empty(v.shape, dtype=v.dtype, pin_memory=True)
+                h.copy_(v, non_blocking=True)
+                self.host[k] = h
+            # Record on the tensors' own device stream; a bare record() would
+            # use the calling thread's current device, which in a worker
+            # thread driving another GPU leaves the copies unguarded.
+            self.event = torch.cuda.Event()
+            self.event.record(torch.cuda.current_stream(dev))
+        else:
+            self.host = {k: v.cpu() for k, v in gpu.items()}
+
+    def wait(self) -> Dict[str, np.ndarray]:
+        if self.event is not None:
+            self.event.synchronize()
+        return {k: v.numpy() for k, v in self.host.items()}
+
+
+def _drive(runner, items: TokenisedItems, batches: Iterable[np.ndarray], store: _OutputStore,
+           progress: Callable[[int], None]) -> None:
+    """Run batches through ``runner`` and write their outputs into ``store``.
+
+    The host-side copy and bookkeeping of batch *i* happen while the GPU runs
+    batch *i + 1*. A batch that runs out of memory is retried rather than
+    failed: a packed row goes through the eager padded engine, and a padded
+    batch is split in half, recursively, so only a protein that cannot fit on
+    its own is recorded as a failure. Any other error records the batch's
+    proteins in ``fail_ids``, as the previous engine did.
+    """
+    pending: Optional[Tuple[np.ndarray, _HostCopy]] = None
+    retry: deque = deque()   # (batch, through_padded) waiting to be rerun
+    padded: List = []        # lazily built eager padded runner for retries
+    warned = [False]
+    source = iter(batches)
+
+    def next_work():
+        if retry:
+            return retry.popleft()
+        b = next(source, None)
+        return None if b is None else (b, False)
+
+    def on_oom(batch, through_padded, exc):
+        _free_memory(runner.device)
+        if not warned[0]:
+            logger.warning(
+                f"Out of memory on {runner.device} for a batch of {len(batch)} items "
+                f"({int(items.lengths[batch].sum())} residues); retrying it in smaller pieces. "
+                "A lower --max_batch_residues avoids the retries."
+            )
+            warned[0] = True
+        if not through_padded and hasattr(runner, "make_eager_padded") and not isinstance(
+                getattr(runner, "primary", runner), _PaddedRunner):
+            retry.appendleft((batch, True))           # packed row -> padded engine
+        elif len(batch) > 1:
+            half = len(batch) // 2                     # keeps longest-first order
+            retry.appendleft((batch[half:], through_padded))
+            retry.appendleft((batch[:half], through_padded))
+        else:
+            return False
+        return True
+
+    def flush(entry):
+        batch, copy = entry
+        try:
+            host = copy.wait()
+        except RuntimeError as exc:
+            _record_failure(store, items, batch, exc)
+        else:
+            store.write(batch, host)
+        progress(len(batch))
+
+    while True:
+        work = next_work()
+        if work is None:
+            break
+        batch, through_padded = work
+        use = runner
+        if through_padded:
+            if not padded:
+                padded.append(runner.make_eager_padded())
+            use = padded[0]
+        try:
+            l3, l12, hid = use.launch(items, batch)
+            copy = _HostCopy(store.device_outputs(l3, l12, hid))
+        except RuntimeError as exc:
+            if _is_oom(exc) and on_oom(batch, through_padded, exc):
+                continue
+            _record_failure(store, items, batch, exc)
+            progress(len(batch))
+            continue
+        if pending is not None:
+            flush(pending)
+        pending = (batch, copy)
+    if pending is not None:
+        flush(pending)
+
+
+def _record_failure(store: _OutputStore, items: TokenisedItems, batch: np.ndarray, exc: Exception) -> None:
+    ids = sorted({items.seq_ids[p] for p in items.item_protein[batch]}) if items.seq_ids else []
+    logger.warning(
+        f"RuntimeError during ModernProst inference — batch of {len(batch)} items, "
+        f"{int(items.lengths[batch].sum())} residues"
+        + (f"; first ids: {ids[:5]}" if ids else "") + f" ({exc})"
+    )
+    store.fail(batch)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Small helpers kept for callers and tests
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _finalise(pred: np.ndarray, probs: np.ndarray, output_probs: bool) -> Tuple:
     """Build the ``(pred, mean_prob, all_prob)`` tuple for one sequence."""
@@ -424,241 +1226,3 @@ def _split_chunk_id(item_id: str) -> Tuple[str, Optional[int]]:
         return base, int(tag)
     except ValueError:
         return item_id, None
-
-
-def _base_ids(item_ids: Tuple[str, ...]) -> List[str]:
-    """Map batch item ids back to their originating sequence ids."""
-    return [_split_chunk_id(i)[0] for i in item_ids]
-
-
-def _tick(pbar, progress_callback, n: int) -> None:
-    """Advance whichever progress reporter is active."""
-    if pbar is not None:
-        pbar.update(n)
-    if progress_callback is not None:
-        progress_callback(n)
-
-
-def _store_embeddings(
-    result: ModernProstResult,
-    chunk_emb_residue: Dict[str, Dict[int, np.ndarray]],
-    hidden: torch.Tensor,
-    i: int,
-    L: int,
-    base_id: str,
-    chunk_idx: Optional[int],
-    save_per_residue: bool,
-    save_per_protein: bool,
-) -> None:
-    """Extract and store this batch row's embeddings."""
-    try:
-        emb = hidden[i, :L].detach().float().cpu().numpy()
-    except Exception:
-        logger.warning(f"Saving embeddings failed for {base_id}")
-        return
-
-    if chunk_idx is not None:
-        # Both the per-residue and the per-protein output need the full
-        # concatenation, so chunks are always stored per-residue and reduced
-        # after stitching.
-        chunk_emb_residue.setdefault(base_id, {})[chunk_idx] = emb
-        return
-
-    if save_per_residue:
-        result.embeddings_per_residue[base_id] = emb
-    if save_per_protein:
-        result.embeddings_per_protein[base_id] = emb.mean(axis=0)
-
-
-def _concat_prediction_chunks(
-    store: Dict[str, Dict[int, Tuple]],
-    sink: Dict[str, Tuple],
-    output_probs: bool,
-) -> None:
-    """Concatenate per-chunk predictions in chunk order and recompute the mean."""
-    for base_id, chunks in store.items():
-        order = sorted(chunks)
-        preds = np.concatenate([chunks[ci][0] for ci in order])
-        probs = np.concatenate([chunks[ci][1] for ci in order])
-        sink[base_id] = _finalise(preds, probs, output_probs)
-
-
-def _concat_profile_chunks(
-    store: Dict[str, Dict[int, np.ndarray]],
-    sink: Dict[str, np.ndarray],
-) -> None:
-    """Concatenate per-chunk profiles along the residue axis, in chunk order."""
-    for base_id, chunks in store.items():
-        sink[base_id] = np.concatenate([chunks[ci] for ci in sorted(chunks)], axis=0)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Multi-GPU dispatcher
-# ─────────────────────────────────────────────────────────────────────────────
-
-def run_modernprost_inference_multi_gpu(
-    seq_dict: List[Tuple[str, str, int]],
-    devices: List[str],
-    model_dir: Path,
-    model_name: str,
-    half_precision: bool,
-    threads: int,
-    task: str = CLASSIFICATION_TASK,
-    check_fn: Optional[Callable] = None,
-    zenodo_fn: Optional[Callable] = None,
-    max_residues: int = 50000,
-    max_seq_len: int = 30000,
-    max_batch: int = 10000,
-    chunk_len: int = DEFAULT_CHUNK_LEN,
-    output_probs: bool = True,
-    save_per_residue_embeddings: bool = False,
-    save_per_protein_embeddings: bool = False,
-    pad_multiple: int = 64,
-    desc: str = "Predicting 3Di + 12st",
-) -> ModernProstResult:
-    """Run ModernProst inference across one or more devices.
-
-    With a single device this loads the model and calls
-    :func:`run_modernprost_inference` directly. With several, the pre-sorted
-    ``seq_dict`` is sharded round-robin, one worker thread per device runs its
-    shard, and the results are merged.
-
-    As in the ProstT5 dispatcher, all N model copies are loaded **sequentially
-    on the main thread** before any worker starts: HuggingFace's
-    ``from_pretrained`` is not thread-safe, and concurrent loads of the same
-    checkpoint can hand the second thread a model whose parameters live on the
-    ``meta`` device, so the subsequent ``.to(device)`` raises
-    "Cannot copy out of meta tensor". Loads are serialised (~N x single-load
-    wall clock); inference stays fully parallel.
-
-    Args:
-        seq_dict: Pre-sorted (descending by length) ``(seq_id, sequence, length)``.
-        devices: Device strings from :func:`pholdlib.prostt5.device.parse_gpus`.
-        model_dir / model_name / half_precision / threads / check_fn / zenodo_fn:
-            passed to :func:`get_modernprost_model`.
-        Everything else is passed straight through to
-        :func:`run_modernprost_inference`.
-
-    Returns:
-        A merged :class:`ModernProstResult`. Dict ordering is not guaranteed;
-        callers must re-order using their own key list.
-
-    Raises:
-        ValueError: if ``devices`` is empty.
-        RuntimeError: if any input sequence is neither predicted nor recorded
-            as a failure — that would otherwise surface downstream as a
-            silently masked CDS.
-    """
-    if not devices:
-        raise ValueError("devices must contain at least one entry")
-
-    from pholdlib.modernprost.model import count_parameters, get_modernprost_model
-
-    common = dict(
-        task=task,
-        max_residues=max_residues,
-        max_seq_len=max_seq_len,
-        max_batch=max_batch,
-        chunk_len=chunk_len,
-        output_probs=output_probs,
-        save_per_residue_embeddings=save_per_residue_embeddings,
-        save_per_protein_embeddings=save_per_protein_embeddings,
-        pad_multiple=pad_multiple,
-    )
-
-    # ── single-device fast path ─────────────────────────────────────────────
-    if len(devices) == 1:
-        dev = devices[0]
-        is_cpu = dev == "cpu"
-        model, tokenizer, torch_device = get_modernprost_model(
-            model_dir,
-            model_name,
-            cpu=is_cpu,
-            threads=threads,
-            check_fn=check_fn,
-            zenodo_fn=zenodo_fn,
-            device=None if is_cpu else dev,
-            half_precision=half_precision,
-        )
-        logger.info(f"ModernProst total parameters: {count_parameters(model):,}")
-        return run_modernprost_inference(
-            seq_dict, model, tokenizer, torch_device, desc=desc, **common
-        )
-
-    # ── multi-GPU path ──────────────────────────────────────────────────────
-    n_devices = len(devices)
-    shards = shard_round_robin(seq_dict, n_devices)
-    logger.info(
-        f"Multi-GPU ModernProst inference across {n_devices} device(s): {devices}. "
-        f"Total sequences: {len(seq_dict)}; per-shard sizes: "
-        f"{[len(s) for s in shards]} (round-robin after global length-sort)."
-    )
-
-    logger.info(f"Loading {n_devices} model instances (sequential, main thread)…")
-    loaded = []
-    for dev in devices:
-        is_cpu = dev == "cpu"
-        model, tokenizer, torch_device = get_modernprost_model(
-            model_dir,
-            model_name,
-            cpu=is_cpu,
-            threads=threads,
-            check_fn=check_fn,
-            zenodo_fn=zenodo_fn,
-            device=None if is_cpu else dev,
-            half_precision=half_precision,
-        )
-        loaded.append((dev, model, tokenizer, torch_device))
-
-    progress_lock = threading.Lock()
-    pbar = tqdm(total=len(seq_dict), desc=desc)
-
-    def _on_batch(n: int) -> None:
-        with progress_lock:
-            pbar.update(n)
-
-    def _worker(dev, model, tokenizer, torch_device, shard) -> ModernProstResult:
-        return run_modernprost_inference(
-            shard,
-            model,
-            tokenizer,
-            torch_device,
-            desc=f"{desc} [{dev}]",
-            progress_callback=_on_batch,
-            **common,
-        )
-
-    merged = ModernProstResult()
-    try:
-        with ThreadPoolExecutor(max_workers=n_devices) as pool:
-            futures = {
-                pool.submit(_worker, dev, model, tokenizer, torch_device, shard): dev
-                for (dev, model, tokenizer, torch_device), shard in zip(loaded, shards)
-                if shard  # skip empty shards (rare: len(seq_dict) < n_devices)
-            }
-            for fut in as_completed(futures):
-                dev = futures[fut]
-                try:
-                    merged.update(fut.result())
-                except Exception:
-                    logger.exception(f"Worker on {dev} failed")
-                    raise
-    finally:
-        pbar.close()
-
-    # ── completeness check ──────────────────────────────────────────────────
-    # Every input seq_id must appear either as a prediction/profile or in
-    # fail_ids. A silent drop would make downstream code mask the CDS as
-    # "XXXX…" with no explanation of why.
-    accounted = (
-        set(merged.predictions_3di) | set(merged.profiles_3di) | set(merged.fail_ids)
-    )
-    dropped = {sid for sid, _, _ in seq_dict} - accounted
-    if dropped:
-        raise RuntimeError(
-            f"Multi-GPU ModernProst inference dropped {len(dropped)} sequence(s) "
-            f"without recording them in fail_ids — likely a bug in batch error "
-            f"handling. First few: {sorted(dropped)[:10]}"
-        )
-
-    return merged
