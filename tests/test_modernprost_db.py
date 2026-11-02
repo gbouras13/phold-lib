@@ -36,6 +36,7 @@ build_lookup = _fsdb.build_lookup
 sort_index_file = _fsdb.sort_index_file
 write_dbtype = _fsdb.write_dbtype
 generate_combined_foldseek_db = _fsdb.generate_combined_foldseek_db
+PACKED_X = _fsdb.PACKED_X
 generate_sequence_foldseek_db = _fsdb.generate_sequence_foldseek_db
 DBTYPE_SS_12ST = _fsdb.DBTYPE_SS_12ST
 
@@ -133,7 +134,7 @@ class TestReadFasta:
 # ===========================================================================
 
 class TestCombinedDb:
-    def _build(self, tmp_path, aa, d3i, s12):
+    def _build(self, tmp_path, aa, d3i, s12, **kwargs):
         _write_fasta(tmp_path / "aa.fasta", aa)
         _write_fasta(tmp_path / "3di.fasta", d3i)
         _write_fasta(tmp_path / "12st.fasta", s12)
@@ -144,7 +145,34 @@ class TestCombinedDb:
             tmp_path / "db",
             "q",
             fake_tsv2db,
+            **kwargs,
         )
+
+    def _payloads(self, tmp_path):
+        raw = (tmp_path / "db" / "q_ss").read_bytes()
+        lookup = build_lookup(tmp_path / "db" / "q.lookup")
+        out = {}
+        for line in (tmp_path / "db" / "q_ss.index").read_text().splitlines():
+            key, offset, length = line.split("\t")
+            sid = next(k for k, v in lookup.items() if v == key)
+            out[sid] = raw[int(offset) : int(offset) + int(length) - 2]
+        return out
+
+    def test_plddt_masking_sets_packed_x(self, tmp_path):
+        aa = {"s1": "MKTI", "s2": "MASMT"}
+        d3i = {"s1": "DVQA", "s2": "PPDDV"}
+        s12 = {"s1": "ACDE", "s2": "AACCD"}
+        plddt = {"s1": [90, 40, 90, 69.9], "s2": [95] * 5}
+        self._build(tmp_path, aa, d3i, s12, plddt=plddt, plddt_threshold=70)
+        got = self._payloads(tmp_path)
+        plain = encode_combined(d3i["s1"], s12["s1"])
+        assert got["s1"] == bytes([plain[0], PACKED_X, plain[2], PACKED_X])
+        assert got["s2"] == encode_combined(d3i["s2"], s12["s2"])
+
+    def test_plddt_threshold_needs_plddt_for_every_record(self, tmp_path):
+        with pytest.raises(ValueError, match="pLDDT"):
+            self._build(tmp_path, {"s1": "MK", "s2": "QQ"}, {"s1": "DV", "s2": "AA"},
+                        {"s1": "AC", "s2": "AA"}, plddt={"s1": [90, 90]}, plddt_threshold=70)
 
     def test_ss_payload_is_patched_with_combined_bytes(self, tmp_path):
         aa = {"s1": "MKTI", "s2": "MASMT"}
@@ -330,9 +358,61 @@ class TestWriteProfileDbs:
         paths = write_profile_foldseek_dbs(
             p3, p12, aa, lookup, tmp_path / "prof", "q", source
         )
-        expected = sum(len(v) for v in aa.values()) * PROFILE_RECORD_STRIDE
+        # L * 25 bytes per record plus Foldseek's null terminator
+        expected = sum(len(v) for v in aa.values()) * PROFILE_RECORD_STRIDE + len(aa)
         for path in paths.values():
             assert path.stat().st_size == expected
+
+    def _records(self, path):
+        data = path.read_bytes()
+        recs = {}
+        for line in Path(f"{path}.index").read_text().splitlines():
+            key, off, size = line.split("\t")
+            recs[key] = data[int(off) : int(off) + int(size)]
+        return recs
+
+    def test_records_end_with_null_byte(self, tmp_path):
+        # Foldseek's DBReader::getSeqLen reads (bytes - 1) / 25 residues
+        aa, source, lookup, p3, p12 = self._fixture(tmp_path)
+        paths = write_profile_foldseek_dbs(
+            p3, p12, aa, lookup, tmp_path / "prof", "q", source
+        )
+        for path in paths.values():
+            recs = self._records(path)
+            for seq_id, seq in aa.items():
+                rec = recs[lookup[seq_id]]
+                assert rec[-1:] == b"\0"
+                assert (len(rec) - 1) // PROFILE_RECORD_STRIDE == len(seq)
+
+    def test_plddt_masking_zeroes_structural_scores_only(self, tmp_path):
+        aa, source, lookup, p3, p12 = self._fixture(tmp_path)
+        plain = write_profile_foldseek_dbs(
+            p3, p12, aa, lookup, tmp_path / "plain", "q", source
+        )
+        plddt = {"s1": np.array([90, 40, 90, 69.9]), "s2": np.full(5, 95.0)}
+        masked = write_profile_foldseek_dbs(
+            p3, p12, aa, lookup, tmp_path / "masked", "q", source,
+            plddt=plddt, plddt_threshold=70,
+        )
+        for name in ("profile_ss", "profile_ss12"):
+            a = self._records(plain[name])[lookup["s1"]]
+            b = self._records(masked[name])[lookup["s1"]]
+            rows_a = np.frombuffer(a[:-1], np.uint8).reshape(-1, PROFILE_RECORD_STRIDE)
+            rows_b = np.frombuffer(b[:-1], np.uint8).reshape(-1, PROFILE_RECORD_STRIDE)
+            low = plddt["s1"] < 70
+            assert (rows_b[low, :20] == 0).all()
+            assert (rows_b[low, 20:] == rows_a[low, 20:]).all()  # query / consensus / neff kept
+            assert (rows_b[~low] == rows_a[~low]).all()
+            assert self._records(plain[name])[lookup["s2"]] == self._records(masked[name])[lookup["s2"]]
+        assert plain["profile"].read_bytes() == masked["profile"].read_bytes()
+
+    def test_plddt_threshold_needs_plddt_for_every_record(self, tmp_path):
+        aa, source, lookup, p3, p12 = self._fixture(tmp_path)
+        with pytest.raises(ValueError, match="pLDDT"):
+            write_profile_foldseek_dbs(
+                p3, p12, aa, lookup, tmp_path / "prof", "q", source,
+                plddt={"s1": np.full(4, 90.0)}, plddt_threshold=70,
+            )
 
     def test_dbtype_and_shard_alias_written(self, tmp_path):
         aa, source, lookup, p3, p12 = self._fixture(tmp_path)

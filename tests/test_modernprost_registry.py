@@ -91,8 +91,9 @@ class TestRegistry:
 # Download / integrity check
 # ===========================================================================
 
-def _make_snapshot(root: Path, model: str, commit: str = "abc123", omit=()):
-    """Build a minimal HuggingFace cache layout for *model*."""
+def _make_snapshot(root: Path, model: str, commit: str = None, omit=()):
+    """Build a minimal HuggingFace cache layout for *model* (default: its pinned revision)."""
+    commit = commit or resolve_modernprost_model(model).revision
     cache = root / f"models--gbouras13--{model}"
     (cache / "refs").mkdir(parents=True, exist_ok=True)
     (cache / "refs" / "main").write_text(commit)
@@ -130,10 +131,19 @@ class TestCheckDownload:
         (snapshot / "model.safetensors").write_text("")
         assert check_modernprost_download(tmp_path, "modernprost-50M") is True
 
-    def test_dangling_ref_needs_download(self, tmp_path):
-        cache, _ = _make_snapshot(tmp_path, "modernprost-50M")
-        (cache / "refs" / "main").write_text("does-not-exist")
+    def test_older_snapshot_needs_download(self, tmp_path):
+        # a cache filled before the pinned release (refs/main -> an older commit)
+        _make_snapshot(tmp_path, "modernprost-50M", commit="2d68d506d4ce8d59025c985fd00243a8860363c6")
         assert check_modernprost_download(tmp_path, "modernprost-50M") is True
+
+    def test_pinned_snapshot_is_used_whatever_refs_main_says(self, tmp_path):
+        cache, _ = _make_snapshot(tmp_path, "modernprost-50M")
+        (cache / "refs" / "main").write_text("a-newer-commit")
+        assert check_modernprost_download(tmp_path, "modernprost-50M") is False
+
+    def test_every_model_pins_a_full_commit(self):
+        for spec in MODERNPROST_MODELS.values():
+            assert len(spec.revision) == 40 and int(spec.revision, 16) >= 0
 
     def test_explicit_md5_dict_is_used(self, tmp_path):
         import hashlib

@@ -133,6 +133,7 @@ def get_modernprost_model(
             model_dir=model_dir,
             force_download=need_download,
             local_files_only=localfile,
+            revision=spec.revision,
         ).to(torch_device)
 
     except Exception as e:
@@ -145,6 +146,7 @@ def get_modernprost_model(
                 model_dir=model_dir,
                 force_download=False,
                 local_files_only=True,
+                revision=spec.revision,
             ).to(torch_device)
         else:
             raise RuntimeError(f"ModernProst model loading failed: {e}") from e
@@ -153,6 +155,7 @@ def get_modernprost_model(
         hf_name,
         trust_remote_code=True,
         cache_dir=f"{model_dir}/",
+        revision=spec.revision,
     )
 
     if half_precision:
@@ -174,6 +177,7 @@ def _from_pretrained_quiet(
     model_dir: Path,
     force_download: bool,
     local_files_only: bool,
+    revision: Optional[str] = None,
 ) -> AutoModel:
     """``AutoModel.from_pretrained`` with the remote code's stdout suppressed.
 
@@ -189,6 +193,7 @@ def _from_pretrained_quiet(
             cache_dir=f"{model_dir}/",
             force_download=force_download,
             local_files_only=local_files_only,
+            revision=revision,
         )
 
 

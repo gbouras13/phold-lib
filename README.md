@@ -140,6 +140,21 @@ ModernProst maps an amino-acid sequence directly to Foldseek's 3Di alphabet **an
 
 The `-pssm` checkpoints are trained to emit calibrated per-residue distributions, which are written straight into Foldseek profile databases rather than being collapsed to an argmax letter.
 
+Each model is pinned to a Hugging Face commit (`MODERNPROST_MODELS[...].revision`; release of 02/11/2026: nng `-pssm` weights and a pLDDT head in every repo). A cache holding another snapshot is re-downloaded by `check_modernprost_download`. The earlier weights are tagged `jul26` on the Hub.
+
+Every repo also ships a small **pLDDT head** (`plddt_head/`) trained on the frozen backbone. Its predicted pLDDT can mask low-confidence residues in either kind of query DB:
+
+```python
+from pholdlib.modernprost.plddt import load_plddt_head, predict_plddt
+
+head = load_plddt_head("modernprost-50M-pssm", model_dir, device)
+plddt = predict_plddt(model, tokenizer, head, aa_sequences, device)      # {id: (L,) array, 0-100}
+write_profile_foldseek_dbs(..., plddt=plddt, plddt_threshold=70)         # -pssm: zero 3Di / 12-state columns
+generate_combined_foldseek_db(..., plddt=plddt, plddt_threshold=70)      # classification: residue -> PACKED_X
+```
+
+Both match `foldseek lowconfquery` byte for byte; the amino-acid DB / profile is never masked.
+
 Requires `transformers >= 4.51` (the checkpoints are HuggingFace `custom_code` models loaded with `trust_remote_code=True`; tested with 5.9, 5.15 and 5.17). Older releases load the classification checkpoints but not the `-pssm` ones, whose config import sits in a `try/except` that the pre-4.51 import scanner misreads as a missing PyPI package. The ProstT5 backend still works on older `transformers`.
 
 ```python
@@ -225,14 +240,22 @@ Compiling costs ~30-60 s on the first batch (cold cache). Keep compile caches be
 
 | Function | Description |
 |---|---|
-| `generate_combined_foldseek_db(fasta_aa, fasta_3di, fasta_12st, foldseek_db_path, db_name, tsv2db_runner)` | Build the combined 3Di+12st query DB. |
+| `generate_combined_foldseek_db(fasta_aa, fasta_3di, fasta_12st, foldseek_db_path, db_name, tsv2db_runner, keep_tsv, plddt, plddt_threshold)` | Build the combined 3Di+12st query DB. With `plddt_threshold`, residues below it become `PACKED_X`. |
 | `generate_sequence_foldseek_db(aa_sequences, foldseek_db_path, db_name, tsv2db_runner)` | Build a plain AA DB + lookup, used as the source for profile DBs. |
-| `write_profile_foldseek_dbs(profiles_3di, profiles_12st, aa_sequences, lookup, output_dir, db_name, source_db)` | Build `_profile_ss`, `_profile_ss12` and `_profile`. |
+| `write_profile_foldseek_dbs(profiles_3di, profiles_12st, aa_sequences, lookup, output_dir, db_name, source_db, order, plddt, plddt_threshold)` | Build `_profile_ss`, `_profile_ss12` and `_profile` (records end with Foldseek's null byte). With `plddt_threshold`, zero the 3Di / 12-state scores of residues below it. |
+| `mask_profile_record(record, low_confidence)` / `mask_combined(combined, plddt, threshold)` | The masking primitives. `PACKED_X` (252) is the combined byte Foldseek reads as X in both alphabets. |
 | `encode_combined(seq_3di, seq_12st)` | Pack one residue pair per byte: `c = 3di_index * 12 + ss12_index`. |
 
 Search a combined or profile DB with `--ss-12st 1`; profile DBs additionally want `--sort-by-structure-bits 0`.
 
-**Masking caveat.** The combined encoding has no 21st 3Di state, so a masked `X` cannot be represented — `encode_combined` rejects it with an actionable error. Write the 3Di FASTA with `mask_threshold=0` and apply confidence masking to the amino-acid FASTA instead.
+**Masking caveat.** The combined encoding has no 21st 3Di state, so `encode_combined` rejects a masked `X` from `write_3di_fasta(mask_threshold=...)`. Mask a combined DB with `PACKED_X` instead (`generate_combined_foldseek_db(..., plddt_threshold=...)`), which sets both letters to X.
+
+### `pholdlib.modernprost.plddt`
+
+| Function | Description |
+|---|---|
+| `load_plddt_head(model_name, model_dir, device, local_files_only)` | Download (pinned revision, same cache as the model) and load a model's pLDDT head; a local model dir with `plddt_head/` also works. |
+| `predict_plddt(model, tokenizer, head, sequences, device, max_residues, chunk_len)` | Per-residue pLDDT for `{id: sequence}`: one padded encoder pass with hooks on every layer; long proteins in `chunk_len` windows. |
 
 ### `pholdlib.databases.modernprost`
 
@@ -241,7 +264,7 @@ Search a combined or profile DB with `--ss-12st 1`; profile DBs additionally wan
 | `MODERNPROST_MODELS` | Registry of the four published checkpoints. |
 | `resolve_modernprost_model(name)` | Look up by short name or full HuggingFace id. |
 | `is_modernprost_model(name)` / `default_task_for(name)` | Branch between backends; get a checkpoint's trained task. |
-| `check_modernprost_download(model_dir, model_name, md5_dict)` | `True` when the model needs (re)downloading. Falls back to a snapshot completeness check when no MD5 dict is registered. |
+| `check_modernprost_download(model_dir, model_name, md5_dict)` | `True` when the model needs (re)downloading. Falls back to a completeness check of the pinned snapshot (`snapshots/<revision>/`) when no MD5 dict is registered. |
 | `download_zenodo_modernprost(...)` | Zenodo backup download + extract. |
 
 ## Notes for downstream tools
