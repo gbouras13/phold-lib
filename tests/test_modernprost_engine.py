@@ -280,7 +280,7 @@ class _OOMRunner:
             raise RuntimeError("MPS backend out of memory (fake)")
         self.ok_sizes.append(len(batch))
         n = int(items.lengths[batch].sum())
-        return torch.zeros(n, 20), torch.zeros(n, 12), None
+        return torch.zeros(n, 20), torch.zeros(n, 12), None, None
 
 
 class TestOutOfMemoryBackoff:

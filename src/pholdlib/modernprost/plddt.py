@@ -10,18 +10,24 @@ layer, mixes them with learned softmax weights, applies two depthwise-conv
 blocks and predicts pLDDT as the expected value over 50 bins. The backbone
 itself is unchanged, so loading the model is unaffected by the head.
 
-The predicted pLDDT is used to mask low-confidence residues of the ``-pssm``
-models' profiles (``write_profile_foldseek_dbs(..., plddt=...,
-plddt_threshold=...)``).
+The predicted pLDDT is used to mask low-confidence residues of the query DBs
+(``write_profile_foldseek_dbs`` / ``generate_combined_foldseek_db`` with
+``plddt=..., plddt_threshold=...``).
 
-The module classes below are copied unchanged from the training script
-(``foldseek2-plm/plddt_head/train_plddt_head.py``) so the saved state dicts load
-as they are; ``plddt_head/plddt_head.py`` in each Hugging Face repo is the same
-code.
+Normally the head runs inside the main inference pass:
+``run_modernprost_inference(..., plddt_head=head)`` returns ``result.plddt``
+next to the 3Di / 12-state outputs, at the cost of the head alone. The layer
+mix is accumulated layer by layer (:class:`LayerMixAccumulator`), so no
+per-layer states are kept. In the packed engine, where several proteins share
+one row, the convolutions take the per-token protein id (``seg``) and never
+read across a protein boundary, which gives exactly the per-protein result.
+:func:`predict_plddt` is a standalone pass for callers that already have
+predictions.
 
-The head runs as a separate pass of the padded engine (encoder only, layer
-outputs captured with forward hooks): the packed engine concatenates proteins,
-and the head's convolutions would read across protein boundaries there.
+The module classes are the training script's
+(``foldseek2-plm/plddt_head/train_plddt_head.py``) with the same parameters, so
+the saved state dicts load as they are; ``seg`` is an addition that changes
+nothing when absent.
 """
 
 import json
@@ -54,9 +60,23 @@ class LayerMix(nn.Module):
         return self.gamma * x
 
 
+def _same_segment(seg, shift):
+    """(B, L) bool: is position ``t + shift`` in the same protein as ``t`` (False off the ends)?"""
+    L = seg.shape[1]
+    out = torch.zeros_like(seg, dtype=torch.bool)
+    if shift >= 0:
+        out[:, : L - shift] = seg[:, shift:] == seg[:, : L - shift]
+    else:
+        out[:, -shift:] = seg[:, : L + shift] == seg[:, -shift:]
+    return out
+
+
 class DepthwiseConv1d(nn.Module):
     """Same params and output as nn.Conv1d(d, d, k, padding=k//2, groups=d) for odd k, on (B, L, d)
-    input, computed as a sum of k shifted copies (MIOpen fails on depthwise conv1d on ROCm)."""
+    input, computed as a sum of k shifted copies (MIOpen fails on depthwise conv1d on ROCm).
+
+    With ``seg`` (B, L), a per-token protein id, neighbours from another protein count as zero padding,
+    so a packed row gives each protein exactly its own padded convolution."""
 
     def __init__(self, d, kernel):
         super().__init__()
@@ -65,11 +85,16 @@ class DepthwiseConv1d(nn.Module):
         nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
         nn.init.uniform_(self.bias, -1 / math.sqrt(kernel), 1 / math.sqrt(kernel))
 
-    def forward(self, x):
+    def forward(self, x, seg=None):
         k, L = self.weight.shape[-1], x.shape[1]
         xp = F.pad(x, (0, 0, k // 2, k // 2))
         w = self.weight[:, 0, :]
-        return self.bias + sum(xp[:, j : j + L] * w[:, j] for j in range(k))
+        if seg is None:
+            return self.bias + sum(xp[:, j : j + L] * w[:, j] for j in range(k))
+        return self.bias + sum(
+            xp[:, j : j + L] * w[:, j] * _same_segment(seg, j - k // 2).unsqueeze(-1).to(x.dtype)
+            for j in range(k)
+        )
 
 
 class ConvBlock(nn.Module):
@@ -82,8 +107,8 @@ class ConvBlock(nn.Module):
         self.fc1 = nn.Linear(d, expand * d)
         self.fc2 = nn.Linear(expand * d, d)
 
-    def forward(self, x, mask):
-        h = self.dwconv(x * mask)
+    def forward(self, x, mask, seg=None):
+        h = self.dwconv(x * mask, seg)
         h = self.fc2(F.gelu(self.fc1(self.norm(h))))
         return (x + h) * mask
 
@@ -102,10 +127,12 @@ class AttnBlock(nn.Module):
         self.fc1 = nn.Linear(d, expand * d)
         self.fc2 = nn.Linear(expand * d, d)
 
-    def forward(self, x, mask):
+    def forward(self, x, mask, seg=None):
         B, L, d = x.shape
         q, k, v = self.qkv(self.norm1(x)).view(B, L, 3, self.n_heads, d // self.n_heads).permute(2, 0, 3, 1, 4)
-        keep = mask[..., 0].bool()[:, None, None, :]
+        keep = mask[..., 0].bool()[:, None, None, :]  # (B, 1, 1, L): attend to real residues only
+        if seg is not None:
+            keep = keep & (seg[:, None, :, None] == seg[:, None, None, :])
         h = F.scaled_dot_product_attention(q, k, v, attn_mask=keep)
         x = x + self.attn_out(h.transpose(1, 2).reshape(B, L, d))
         x = x + self.fc2(F.gelu(self.fc1(self.norm2(x))))
@@ -126,18 +153,68 @@ class PlddtHead(nn.Module):
         self.register_buffer("bin_centers", (torch.arange(n_bins) + 0.5) * (100.0 / n_bins), persistent=False)
 
     def forward(self, hidden_states, attention_mask):
+        return self.from_mixed(self.mix(hidden_states), attention_mask)
+
+    def from_mixed(self, mixed, attention_mask, seg=None):
+        """Logits from the layer mix (``self.mix`` output). ``seg``: per-token protein id for packed rows."""
         mask = attention_mask.unsqueeze(-1).float()
-        x = self.proj(self.mix(hidden_states)) * mask
+        x = self.proj(mixed) * mask
         for block in self.blocks:
-            x = block(x, mask)
+            x = block(x, mask, seg)
         for block in self.attn_blocks:
-            x = block(x, mask)
+            x = block(x, mask, seg)
         return self.out(self.norm(x)).float()  # (B, L, n_bins)
 
     def predict(self, logits):
         if self.n_bins == 1:
             return torch.sigmoid(logits.squeeze(-1)) * 100.0
         return torch.softmax(logits, dim=-1) @ self.bin_centers
+
+    def mix_weights(self) -> Dict[int, torch.Tensor]:
+        """{0-based encoder layer index: its mix weight (gamma folded in)}."""
+        w = torch.softmax(self.mix.weights, dim=0) * self.mix.gamma
+        return {layer - 1: w[i] for i, layer in enumerate(self.layers)}
+
+
+class LayerMixAccumulator:
+    """Forward hooks that build the head's layer mix while the backbone runs.
+
+    Each hooked layer adds ``w_i * layer_norm(output)`` into one float32
+    buffer, so only one (B, L, H) tensor is kept instead of one per layer.
+    Use as a context manager around the forward; the hooks are removed on exit.
+    """
+
+    def __init__(self, model, head: PlddtHead):
+        if int(model.config.hidden_size) != head.hidden_size:
+            raise ValueError(f"pLDDT head expects hidden size {head.hidden_size}, "
+                             f"model has {model.config.hidden_size}")
+        self.layers = model.encoder.layers
+        self.head = head
+        self.mixed = None
+        self._handles = []
+
+    def _hook(self, w):
+        def fn(module, args, output):
+            h = output[0] if isinstance(output, tuple) else output
+            if h.dim() == 4:  # hyper-connection streams (B, L, n, H) -> (B, L, H)
+                h = h.sum(dim=2)
+            term = w * F.layer_norm(h.float(), h.shape[-1:])
+            self.mixed = term if self.mixed is None else self.mixed + term
+
+        return fn
+
+    def __enter__(self):
+        self.mixed = None
+        with torch.no_grad():
+            weights = self.head.mix_weights()
+        self._handles = [self.layers[i].register_forward_hook(self._hook(w)) for i, w in weights.items()]
+        return self
+
+    def __exit__(self, *exc):
+        for h in self._handles:
+            h.remove()
+        self._handles = []
+        return False
 
 
 def _head_paths(model_name: str, model_dir: Union[str, Path], local_files_only: bool) -> Dict[str, Path]:
@@ -188,58 +265,40 @@ def predict_plddt(
     max_residues: int = 16384,
     chunk_len: Optional[int] = None,
 ) -> Dict[str, np.ndarray]:
-    """Predict per-residue pLDDT (0-100) for ``{seq_id: amino-acid sequence}``.
+    """Standalone pLDDT pass (0-100 per residue) for ``{seq_id: amino-acid sequence}``.
 
-    Proteins longer than *chunk_len* (default ``DEFAULT_CHUNK_LEN``) are
-    predicted in windows and stitched back together. Batches are length-sorted
-    and hold about *max_residues* padded tokens.
+    Prefer ``run_modernprost_inference(..., plddt_head=head)``, which predicts
+    pLDDT in the same pass as the 3Di / 12-state outputs. This pass tokenises
+    and chunks exactly as inference does (``TokenisedItems``: the same token
+    table, and proteins longer than *chunk_len*, default ``DEFAULT_CHUNK_LEN``,
+    split into near-equal chunks), so both give the same values. Batches are
+    length-sorted and hold about *max_residues* padded tokens.
     """
+    from pholdlib.modernprost.batching import TokenisedItems, lut_from_tokenizer
     from pholdlib.modernprost.inference import DEFAULT_CHUNK_LEN
 
-    if model.config.hidden_size != head.hidden_size:
-        raise ValueError(f"pLDDT head expects hidden size {head.hidden_size}, model has {model.config.hidden_size}")
-    chunk_len = chunk_len or DEFAULT_CHUNK_LEN
-
-    pieces = []  # (seq_id, window start, window)
-    for seq_id, seq in sequences.items():
-        seq = seq.upper()
-        for begin in range(0, max(len(seq), 1), chunk_len):
-            pieces.append((seq_id, begin, seq[begin : begin + chunk_len]))
-    pieces.sort(key=lambda p: -len(p[2]))
-
-    captured = {}
-
-    def hook(i):
-        def fn(module, args, output):
-            h = output[0] if isinstance(output, tuple) else output
-            captured[i] = h.sum(dim=2) if h.dim() == 4 else h  # hyper-connection streams -> (B, L, H)
-
-        return fn
-
-    layer_idx = [l - 1 for l in head.layers]
-    handles = [model.encoder.layers[i].register_forward_hook(hook(i)) for i in layer_idx]
-    windows: Dict[str, list] = {seq_id: [] for seq_id in sequences}
-    try:
-        start = 0
-        while start < len(pieces):
-            width = max(len(pieces[start][2]), 1)
-            n = max(1, max_residues // width)
-            batch = pieces[start : start + n]
-            start += n
-            enc = tokenizer([s for _, _, s in batch], add_special_tokens=False, padding=True, return_tensors="pt")
-            ids = enc["input_ids"].to(device)
-            mask = enc["attention_mask"].to(device)
-            captured.clear()
-            model.encoder(ids, mask)
-            pred = head.predict(head([captured[i] for i in layer_idx], mask)).float().cpu().numpy()
-            for row, (seq_id, begin, s) in enumerate(batch):
-                windows[seq_id].append((begin, pred[row, : len(s)]))
-    finally:
-        for h in handles:
-            h.remove()
-
-    out = {}
-    for seq_id, seq in sequences.items():
-        parts = [p for _, p in sorted(windows[seq_id], key=lambda w: w[0])]
-        out[seq_id] = np.concatenate(parts).astype(np.float32)
-    return out
+    items = TokenisedItems.from_sequences([(k, v, len(v)) for k, v in sequences.items()],
+                                          lut_from_tokenizer(tokenizer), chunk_len or DEFAULT_CHUNK_LEN)
+    acc = LayerMixAccumulator(model, head)
+    out = np.zeros(items.n_tokens, dtype=np.float32)
+    order = np.argsort(-items.lengths, kind="stable")
+    order = order[items.lengths[order] > 0]
+    start = 0
+    while start < len(order):
+        width = int(items.lengths[order[start]])
+        batch = order[start : start + max(1, max_residues // width)]
+        start += len(batch)
+        ids = np.zeros((len(batch), width), dtype=np.int64)
+        for r, k in enumerate(batch):
+            o, L = int(items.offsets[k]), int(items.lengths[k])
+            ids[r, :L] = items.tokens[o : o + L]
+        ids_t = torch.from_numpy(ids).to(device)
+        mask = ids_t != 0  # <pad> is id 0
+        with acc:
+            model.encoder(ids_t, mask)
+        pred = head.predict(head.from_mixed(acc.mixed, mask)).float().cpu().numpy()
+        for r, k in enumerate(batch):
+            o, L = int(items.offsets[k]), int(items.lengths[k])
+            out[o : o + L] = pred[r, :L]
+    po = items.protein_offsets
+    return {seq_id: out[po[p] : po[p + 1]].copy() for p, seq_id in enumerate(items.seq_ids)}

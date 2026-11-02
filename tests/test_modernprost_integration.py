@@ -124,3 +124,32 @@ class TestMultiDeviceQueue:
         assert not multi.fail_ids
         for sid, _ in SEQS:
             assert np.array_equal(single.predictions_3di[sid][0], multi.predictions_3di[sid][0])
+
+
+class TestPlddtInPass:
+    """pLDDT predicted in the inference pass equals the standalone pass, on both engines, and adding the
+    head changes none of the 3Di / 12-state outputs."""
+
+    @pytest.fixture(scope="class")
+    def head_and_ref(self, models, model_dir):
+        from pholdlib.modernprost.plddt import load_plddt_head, predict_plddt
+
+        model, tok, dev = models["modernprost-50M-pssm"]
+        head = load_plddt_head("modernprost-50M-pssm", model_dir, dev)
+        return head, predict_plddt(model, tok, head, dict(SEQS), dev)
+
+    def test_padded(self, models, head_and_ref):
+        head, ref = head_and_ref
+        plain = _run(models, "modernprost-50M-pssm", "padded")
+        res = _run(models, "modernprost-50M-pssm", "padded", plddt_head=head)
+        for sid, seq in SEQS:
+            assert res.plddt[sid].shape == (len(seq),)
+            np.testing.assert_allclose(res.plddt[sid], ref[sid], atol=1e-3)
+            assert np.array_equal(plain.profiles_3di[sid], res.profiles_3di[sid])
+            assert np.array_equal(plain.profiles_12st[sid], res.profiles_12st[sid])
+
+    def test_packed(self, models, head_and_ref, allow_cpu_packed):
+        head, ref = head_and_ref
+        res = _run(models, "modernprost-50M-pssm", "packed", compile="none", pack_tokens=2048, plddt_head=head)
+        for sid, seq in SEQS:
+            np.testing.assert_allclose(res.plddt[sid], ref[sid], atol=1e-3)

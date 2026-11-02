@@ -145,6 +145,8 @@ class ModernProstResult:
             profiles. Empty for the ``classification`` task.
         embeddings_per_residue / embeddings_per_protein: optional embedding
             stores, keyed by seq_id.
+        plddt: ``{seq_id: float32 (L,)}`` predicted pLDDT (0-100), when a
+            pLDDT head was given.
         fail_ids: sequence IDs that could not be processed.
 
     Arrays are views into per-run buffers; copy one before modifying it in
@@ -157,6 +159,7 @@ class ModernProstResult:
     profiles_12st: Dict[str, np.ndarray] = field(default_factory=dict)
     embeddings_per_residue: Dict[str, np.ndarray] = field(default_factory=dict)
     embeddings_per_protein: Dict[str, np.ndarray] = field(default_factory=dict)
+    plddt: Dict[str, np.ndarray] = field(default_factory=dict)
     fail_ids: List[str] = field(default_factory=list)
 
     def update(self, other: "ModernProstResult") -> None:
@@ -167,6 +170,7 @@ class ModernProstResult:
         self.profiles_12st.update(other.profiles_12st)
         self.embeddings_per_residue.update(other.embeddings_per_residue)
         self.embeddings_per_protein.update(other.embeddings_per_protein)
+        self.plddt.update(other.plddt)
         self.fail_ids.extend(other.fail_ids)
 
 
@@ -215,6 +219,7 @@ def run_modernprost_inference(
     engine: str = "auto",
     compile: str = "auto",
     pack_tokens: int = DEFAULT_PACK_TOKENS,
+    plddt_head=None,
 ) -> ModernProstResult:
     """
     Run ModernProst on a list of protein sequences with one loaded model.
@@ -248,6 +253,12 @@ def run_modernprost_inference(
             name the mode: ``"full"`` / ``"flex"`` (packed), ``"dynamic"``
             (padded under ``torch.compile(dynamic=True)``) or ``"none"``.
         pack_tokens: packed engine: tokens per packed row.
+        plddt_head: optional head from
+            :func:`pholdlib.modernprost.plddt.load_plddt_head`; predicts
+            per-residue pLDDT (``result.plddt``) in the same pass. The padded
+            engine then runs eagerly (its hooks do not go through
+            ``torch.compile``); the packed engine compiles the head with the
+            rest of the forward.
 
     Returns:
         A :class:`ModernProstResult`.
@@ -259,11 +270,11 @@ def run_modernprost_inference(
     chosen, mode = _choose_engine(engine, compile, device, model, items.n_tokens)
     pack_tokens = _fit_pack_tokens(items, chosen, pack_tokens)
     store = _OutputStore(items, task, save_per_residue_embeddings or save_per_protein_embeddings,
-                         hidden_size=int(model.config.hidden_size))
+                         hidden_size=int(model.config.hidden_size), want_plddt=plddt_head is not None)
     batches = _plan(items, chosen, max_residues, pad_multiple, max_batch, pack_tokens, device,
                     _score_cap(device, model))
     runner = _make_runner(chosen, model, device, mode, pack_tokens, pad_multiple,
-                          n_encoders=1, want_hidden=store.want_hidden)
+                          n_encoders=1, want_hidden=store.want_hidden, plddt_head=plddt_head)
 
     pbar = None
     if progress_callback is None:
@@ -300,6 +311,7 @@ def run_modernprost_inference_multi_gpu(
     engine: str = "auto",
     compile: str = "auto",
     pack_tokens: int = DEFAULT_PACK_TOKENS,
+    plddt: bool = False,
 ) -> ModernProstResult:
     """Load the model on each device and run inference across all of them.
 
@@ -327,6 +339,8 @@ def run_modernprost_inference_multi_gpu(
         devices: device strings from :func:`pholdlib.prostt5.device.parse_gpus`.
         model_dir / model_name / half_precision / threads / check_fn / zenodo_fn:
             passed to :func:`get_modernprost_model`.
+        plddt: also predict per-residue pLDDT (``result.plddt``) in the same
+            pass, with the model's pLDDT head (loaded on every device).
         Everything else as in :func:`run_modernprost_inference`.
 
     Returns:
@@ -342,9 +356,15 @@ def run_modernprost_inference_multi_gpu(
         raise ValueError("devices must contain at least one entry")
 
     from pholdlib.modernprost.model import count_parameters, get_modernprost_model
+    from pholdlib.modernprost.plddt import load_plddt_head
 
     task = _check_task(task)
     t_start = time.perf_counter()
+
+    def load_head(dev, first: bool):
+        if not plddt:
+            return None
+        return load_plddt_head(model_name, model_dir, dev, local_files_only=not first)
 
     def load(dev: str, first: bool):
         is_cpu = dev == "cpu"
@@ -362,6 +382,7 @@ def run_modernprost_inference_multi_gpu(
         )
 
     model0, tokenizer, device0 = load(devices[0], True)
+    head0 = load_head(device0, True)
     logger.info(f"ModernProst total parameters: {count_parameters(model0):,}")
 
     items = TokenisedItems.from_sequences(seq_dict, lut_from_tokenizer(tokenizer), chunk_len)
@@ -373,7 +394,7 @@ def run_modernprost_inference_multi_gpu(
                      and all(str(d).startswith("cuda") for d in devices))
     want_hidden = save_per_residue_embeddings or save_per_protein_embeddings
     store = _OutputStore(items, task, want_hidden, hidden_size=int(model0.config.hidden_size),
-                         shared=use_processes)
+                         shared=use_processes, want_plddt=plddt)
     batches = _plan(items, chosen, max_residues, pad_multiple, max_batch, pack_tokens, device0,
                     _score_cap(device0, model0))
     if len(devices) > 1:
@@ -400,11 +421,14 @@ def run_modernprost_inference_multi_gpu(
                                half_precision=half_precision,
                                threads=max(1, threads // len(devices)), task=task, engine=chosen,
                                mode=mode, pack_tokens=pack_tokens, pad_multiple=pad_multiple,
-                               want_hidden=want_hidden)
+                               want_hidden=want_hidden, plddt=plddt)
             t_run = _run_with_processes(model0, device0, devices, items, store, batches,
-                                        worker_args, on_batch)
+                                        worker_args, on_batch, head0)
         else:
-            loaded = [(model0, device0)] + [load(dev, False)[0::2] for dev in devices[1:]]
+            loaded = [(model0, device0, head0)]
+            for dev in devices[1:]:
+                m, _, d = load(dev, False)
+                loaded.append((m, d, load_head(d, False)))
             logger.info(f"Loaded {len(loaded)} ModernProst model cop{'y' if len(loaded) == 1 else 'ies'} "
                         f"in {time.perf_counter() - t_start:.1f} s")
             t_run = _run_with_threads(loaded, items, store, batches, chosen, mode, pack_tokens,
@@ -437,14 +461,14 @@ def run_modernprost_inference_multi_gpu(
 
 def _run_with_threads(loaded, items, store, batches, engine, mode, pack_tokens, pad_multiple,
                       on_batch) -> float:
-    """Drive every loaded (model, device) from one shared queue, one thread
-    per device. Returns the time the main phase started."""
+    """Drive every loaded (model, device, pLDDT head or None) from one shared
+    queue, one thread per device. Returns the time the main phase started."""
     queue = _BatchQueue(batches)
     runners = []
-    for model, dev in loaded:
+    for model, dev, head in loaded:
         _set_device(dev)
         runner = _make_runner(engine, model, dev, mode, pack_tokens, pad_multiple,
-                              n_encoders=len(loaded), want_hidden=store.want_hidden)
+                              n_encoders=len(loaded), want_hidden=store.want_hidden, plddt_head=head)
         # A compiled engine compiles on its first batches: do that here, one
         # device at a time, on real batches. The longest and the shortest
         # batch bracket every shape a dynamic-shape (padded) graph will see.
@@ -470,7 +494,7 @@ def _run_with_threads(loaded, items, store, batches, engine, mode, pack_tokens, 
 
 
 def _run_with_processes(model0, device0, devices, items: TokenisedItems, store: "_OutputStore",
-                        batches: List[np.ndarray], worker_args: dict, on_batch) -> float:
+                        batches: List[np.ndarray], worker_args: dict, on_batch, head0=None) -> float:
     """Drive ``devices[0]`` here and every other device from a spawned worker
     process, all pulling from one shared batch counter. Returns the time the
     main phase started."""
@@ -522,7 +546,7 @@ def _run_with_processes(model0, device0, devices, items: TokenisedItems, store: 
     _set_device(device0)
     runner = _make_runner(worker_args["engine"], model0, device0, worker_args["mode"],
                           worker_args["pack_tokens"], worker_args["pad_multiple"], n_encoders=1,
-                          want_hidden=worker_args["want_hidden"])
+                          want_hidden=worker_args["want_hidden"], plddt_head=head0)
     _drive(runner, items, _SharedBatchQueue(batches, counter, counter_lock).iterate(), store, on_batch)
 
     for p in procs:
@@ -591,9 +615,17 @@ def _process_worker(rank: int, device: str, args: dict, shared_items: dict, shar
         items = TokenisedItems(seq_ids=[], item_protein=n["item_protein"], lengths=n["lengths"],
                                offsets=n["offsets"], tokens=n["tokens"],
                                protein_offsets=np.zeros(1, dtype=np.int64), n_chunked=0)
-        store = _OutputStore.attach(items, args["task"], args["want_hidden"], shared_out)
+        head = None
+        if args["plddt"]:
+            from pholdlib.modernprost.plddt import load_plddt_head
+
+            # the parent downloaded it already
+            head = load_plddt_head(args["model_name"], Path(args["model_dir"]), dev, local_files_only=True)
+        store = _OutputStore.attach(items, args["task"], args["want_hidden"], shared_out,
+                                    want_plddt=args["plddt"])
         runner = _make_runner(args["engine"], model, dev, args["mode"], args["pack_tokens"],
-                              args["pad_multiple"], n_encoders=1, want_hidden=args["want_hidden"])
+                              args["pad_multiple"], n_encoders=1, want_hidden=args["want_hidden"],
+                              plddt_head=head)
         _drive(runner, items, _SharedBatchQueue(batches, counter, counter_lock).iterate(), store,
                lambda k: msgs.put(("progress", k)))
         msgs.put(("done", rank, store.failed_items))
@@ -820,13 +852,21 @@ class _PaddedRunner:
     """One protein per row, through the checkpoint's own forward."""
 
     def __init__(self, model, device: torch.device, pad_multiple: int, compile: str,
-                 want_hidden: bool):
+                 want_hidden: bool, plddt_head=None):
+        if plddt_head is not None and compile == "dynamic":
+            logger.info("pLDDT head: the padded engine runs eagerly (layer hooks are not compiled).")
+            compile = "none"
         self.device = device
         self.pad_multiple = pad_multiple
         self.compiled = compile == "dynamic"
         self.forward = torch.compile(model, dynamic=True) if self.compiled else model
         self.pin = device.type == "cuda"
         self.want_hidden = want_hidden
+        self.plddt_head = plddt_head
+        if plddt_head is not None:
+            from pholdlib.modernprost.plddt import LayerMixAccumulator
+
+            self.mix = LayerMixAccumulator(model, plddt_head)
 
     def launch(self, items: TokenisedItems, batch: np.ndarray):
         lens = items.lengths[batch]
@@ -851,29 +891,39 @@ class _PaddedRunner:
         sel_g = _to_device(sel, self.device, self.pin)
         mask = ids != 0  # <pad> is id 0; every residue, even unknown, is >= 2
         with torch.inference_mode():
-            out = self.forward(input_ids=ids, attention_mask=mask)
+            if self.plddt_head is None:
+                out = self.forward(input_ids=ids, attention_mask=mask)
+            else:
+                with self.mix:
+                    out = self.forward(input_ids=ids, attention_mask=mask)
             l3 = out.logits["3di"].reshape(B * Lp, -1).index_select(0, sel_g)
             l12 = out.logits["12st"].reshape(B * Lp, -1).index_select(0, sel_g)
             hid = None
             if self.want_hidden:
                 hid = out.last_hidden_state.reshape(B * Lp, -1).index_select(0, sel_g)
-        return l3, l12, hid
+            pl = None
+            if self.plddt_head is not None:
+                head = self.plddt_head
+                pl = head.predict(head.from_mixed(self.mix.mixed, mask)).reshape(B * Lp).index_select(0, sel_g)
+                self.mix.mixed = None
+        return l3, l12, hid, pl
 
 
 class _PackedRunner:
     """Packed rows through :class:`pholdlib.modernprost.packed.PackedEncoder`."""
 
-    def __init__(self, model, device: torch.device, mode: str, pack_tokens: int, n_encoders: int):
+    def __init__(self, model, device: torch.device, mode: str, pack_tokens: int, n_encoders: int,
+                 plddt_head=None):
         from pholdlib.modernprost.packed import PackedEncoder
 
         self.encoder = PackedEncoder(model, device, capacity=pack_tokens, compile=mode,
-                                     n_encoders=n_encoders)
+                                     n_encoders=n_encoders, plddt_head=plddt_head)
         self.device = device
         self.compiled = mode in ("full", "flex")
 
     def launch(self, items: TokenisedItems, batch: np.ndarray):
-        l3, l12, hid, n_real = self.encoder.run_batch(items, batch)
-        return l3[:n_real], l12[:n_real], hid[:n_real]
+        l3, l12, hid, pl, n_real = self.encoder.run_batch(items, batch)
+        return l3[:n_real], l12[:n_real], hid[:n_real], None if pl is None else pl[:n_real]
 
 
 class _FallbackRunner:
@@ -910,21 +960,21 @@ class _FallbackRunner:
 
 
 def _make_runner(engine: str, model, device: torch.device, mode: str, pack_tokens: int,
-                 pad_multiple: int, n_encoders: int, want_hidden: bool):
+                 pad_multiple: int, n_encoders: int, want_hidden: bool, plddt_head=None):
     """Runner for the resolved ``(engine, mode)``. Compiled runners are
     wrapped so a compile failure on the first batch drops that device to the
     eager padded engine instead of failing every batch."""
     def eager_padded():
-        return _PaddedRunner(model, device, pad_multiple, "none", want_hidden)
+        return _PaddedRunner(model, device, pad_multiple, "none", want_hidden, plddt_head)
 
     if engine == "packed":
         try:
-            primary = _PackedRunner(model, device, mode, pack_tokens, n_encoders)
+            primary = _PackedRunner(model, device, mode, pack_tokens, n_encoders, plddt_head)
         except Exception as exc:  # noqa: BLE001 - any setup failure falls back
             logger.warning(f"Packed ModernProst engine failed to start ({exc}); using the padded engine.")
             primary = eager_padded()
     else:
-        primary = _PaddedRunner(model, device, pad_multiple, mode, want_hidden)
+        primary = _PaddedRunner(model, device, pad_multiple, mode, want_hidden, plddt_head)
     runner = _FallbackRunner(primary, eager_padded) if primary.compiled else primary
     # used by _drive to retry a batch that ran out of memory
     runner.make_eager_padded = eager_padded
@@ -967,7 +1017,7 @@ class _OutputStore:
     """
 
     def __init__(self, items: TokenisedItems, task: str, want_hidden: bool, hidden_size: int,
-                 shared: bool = False):
+                 shared: bool = False, want_plddt: bool = False):
         n = items.n_tokens
         if task == PSSM_TASK:
             spec = {"P3": ((n, 20), torch.float32), "P12": ((n, 12), torch.float32)}
@@ -976,6 +1026,8 @@ class _OutputStore:
                     "q3": ((n,), torch.float32), "q12": ((n,), torch.float32)}
         if want_hidden:
             spec["H"] = ((n, hidden_size), torch.float32)
+        if want_plddt:
+            spec["PL"] = ((n,), torch.float32)
         # per-item completion flag (zero-length items never reach the model)
         spec["done"] = ((items.n_items,), torch.uint8)
         # torch tensors so they can live in shared memory for worker processes
@@ -984,12 +1036,13 @@ class _OutputStore:
         if shared:
             for t in self.tensors.values():
                 t.share_memory_()
-        self._init(items, task, want_hidden)
+        self._init(items, task, want_hidden, want_plddt)
 
-    def _init(self, items: TokenisedItems, task: str, want_hidden: bool) -> None:
+    def _init(self, items: TokenisedItems, task: str, want_hidden: bool, want_plddt: bool = False) -> None:
         self.items = items
         self.task = task
         self.want_hidden = want_hidden
+        self.want_plddt = want_plddt
         self.arrays = {k: t.numpy() for k, t in self.tensors.items() if k != "done"}
         self.done = self.tensors["done"].numpy()
         self.failed_items: List[np.ndarray] = []
@@ -997,14 +1050,14 @@ class _OutputStore:
 
     @classmethod
     def attach(cls, items: TokenisedItems, task: str, want_hidden: bool,
-               tensors: Dict[str, torch.Tensor]) -> "_OutputStore":
+               tensors: Dict[str, torch.Tensor], want_plddt: bool = False) -> "_OutputStore":
         """A store over another process's shared buffers."""
         store = cls.__new__(cls)
         store.tensors = tensors
-        store._init(items, task, want_hidden)
+        store._init(items, task, want_hidden, want_plddt)
         return store
 
-    def device_outputs(self, l3, l12, hid) -> Dict[str, torch.Tensor]:
+    def device_outputs(self, l3, l12, hid, pl=None) -> Dict[str, torch.Tensor]:
         """Reduce logits on the device to exactly what is copied back."""
         if self.task == PSSM_TASK:
             out = {"P3": torch.softmax(l3.float(), dim=-1), "P12": torch.softmax(l12.float(), dim=-1)}
@@ -1016,6 +1069,8 @@ class _OutputStore:
             out = {"p3": p3.to(torch.int8), "p12": p12.to(torch.int8), "q3": q3, "q12": q12}
         if self.want_hidden:
             out["H"] = hid.float()
+        if self.want_plddt:
+            out["PL"] = pl.float()
         return out
 
     def write(self, batch: np.ndarray, host: Dict[str, np.ndarray]) -> None:
@@ -1066,6 +1121,8 @@ class _OutputStore:
                     a["p3"][s:e], round(100 * float(means3[p]), 2), a["q3"][s:e] if output_probs else None)
                 result.predictions_12st[seq_id] = (
                     a["p12"][s:e], round(100 * float(means12[p]), 2), a["q12"][s:e] if output_probs else None)
+            if self.want_plddt:
+                result.plddt[seq_id] = a["PL"][s:e]
             if per_residue:
                 result.embeddings_per_residue[seq_id] = a["H"][s:e]
             if per_protein:
@@ -1178,8 +1235,8 @@ def _drive(runner, items: TokenisedItems, batches: Iterable[np.ndarray], store: 
                 padded.append(runner.make_eager_padded())
             use = padded[0]
         try:
-            l3, l12, hid = use.launch(items, batch)
-            copy = _HostCopy(store.device_outputs(l3, l12, hid))
+            l3, l12, hid, pl = use.launch(items, batch)
+            copy = _HostCopy(store.device_outputs(l3, l12, hid, pl))
         except RuntimeError as exc:
             if _is_oom(exc) and on_oom(batch, through_padded, exc):
                 continue

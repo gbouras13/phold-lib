@@ -145,15 +145,20 @@ Each model is pinned to a Hugging Face commit (`MODERNPROST_MODELS[...].revision
 Every repo also ships a small **pLDDT head** (`plddt_head/`) trained on the frozen backbone. Its predicted pLDDT can mask low-confidence residues in either kind of query DB:
 
 ```python
-from pholdlib.modernprost.plddt import load_plddt_head, predict_plddt
+from pholdlib.modernprost.plddt import load_plddt_head
 
 head = load_plddt_head("modernprost-50M-pssm", model_dir, device)
-plddt = predict_plddt(model, tokenizer, head, aa_sequences, device)      # {id: (L,) array, 0-100}
-write_profile_foldseek_dbs(..., plddt=plddt, plddt_threshold=70)         # -pssm: zero 3Di / 12-state columns
-generate_combined_foldseek_db(..., plddt=plddt, plddt_threshold=70)      # classification: residue -> PACKED_X
+result = run_modernprost_inference(seq_dict, model, tokenizer, device, task="pssm", plddt_head=head)
+# result.plddt: {id: (L,) float32, 0-100}, predicted in the same forward pass
+write_profile_foldseek_dbs(..., plddt=result.plddt, plddt_threshold=50)   # -pssm: zero 3Di / 12-state columns
+generate_combined_foldseek_db(..., plddt=result.plddt, plddt_threshold=50) # classification: residue -> PACKED_X
 ```
 
-Both match `foldseek lowconfquery` byte for byte; the amino-acid DB / profile is never masked.
+The head adds ~3% to inference (one 50M-PSSM CPU benchmark): the layer mix is accumulated while the encoder runs,
+and the packed engine runs the head inside its (compiled) forward with the convolutions confined to each protein,
+so the result equals running each protein on its own. `run_modernprost_inference_multi_gpu(..., plddt=True)` loads
+the head on every device. Both maskings match `foldseek lowconfquery` byte for byte; the amino-acid DB / profile is
+never masked.
 
 Requires `transformers >= 4.51` (the checkpoints are HuggingFace `custom_code` models loaded with `trust_remote_code=True`; tested with 5.9, 5.15 and 5.17). Older releases load the classification checkpoints but not the `-pssm` ones, whose config import sits in a `try/except` that the pre-4.51 import scanner misreads as a missing PyPI package. The ProstT5 backend still works on older `transformers`.
 
@@ -192,7 +197,7 @@ generate_combined_foldseek_db(
 | Function | Description |
 |---|---|
 | `get_modernprost_model(model_dir, model_name, cpu, threads, check_fn, zenodo_fn, device, half_precision)` | Load a ModernProst model + tokenizer. Returns `(model, tokenizer, device)`. |
-| `run_modernprost_inference(seq_dict, model, tokenizer, device, task=..., engine="auto", compile="auto", max_residues=65536, ...)` | Batch inference with one loaded model. Returns a `ModernProstResult`. |
+| `run_modernprost_inference(seq_dict, model, tokenizer, device, task=..., engine="auto", compile="auto", max_residues=65536, ..., plddt_head=None)` | Batch inference with one loaded model. Returns a `ModernProstResult` (`.plddt` filled when a pLDDT head is given). |
 | `run_modernprost_inference_multi_gpu(seq_dict, devices, model_dir, model_name, ...)` | Tokenises and plans once; one worker per device pulls batches from a shared queue into one set of output buffers. Workers are threads for eager runs; with `torch.compile` on several GPUs they are processes (this one drives the first GPU, spawned workers the rest, sharing buffers through shared memory), because compilation is serialised within a process (~20-25 s per A100) but runs in parallel across processes. |
 
 `ModernProstResult` fields:
@@ -255,7 +260,8 @@ Search a combined or profile DB with `--ss-12st 1`; profile DBs additionally wan
 | Function | Description |
 |---|---|
 | `load_plddt_head(model_name, model_dir, device, local_files_only)` | Download (pinned revision, same cache as the model) and load a model's pLDDT head; a local model dir with `plddt_head/` also works. |
-| `predict_plddt(model, tokenizer, head, sequences, device, max_residues, chunk_len)` | Per-residue pLDDT for `{id: sequence}`: one padded encoder pass with hooks on every layer; long proteins in `chunk_len` windows. |
+| `predict_plddt(model, tokenizer, head, sequences, device, max_residues, chunk_len)` | Standalone pLDDT pass for `{id: sequence}` (tokenised and chunked exactly as inference). Prefer `run_modernprost_inference(..., plddt_head=head)`, which needs no extra pass. |
+| `LayerMixAccumulator(model, head)` | Context manager: hooks that build the head's layer mix during any forward. |
 
 ### `pholdlib.databases.modernprost`
 

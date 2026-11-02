@@ -44,16 +44,13 @@ class _Model(nn.Module):
 
 
 class _Tokenizer:
-    """One token per residue, right-padded with 0 — like the ModernProst tokenizer."""
+    """One token per residue, right-padded with 0 — like the ModernProst tokenizer. Inference (and
+    predict_plddt) only read its vocabulary, through ``lut_from_tokenizer``."""
 
-    def __call__(self, seqs, add_special_tokens=False, padding=True, return_tensors="pt"):
-        L = max(len(s) for s in seqs)
-        ids = torch.zeros(len(seqs), L, dtype=torch.long)
-        mask = torch.zeros(len(seqs), L, dtype=torch.long)
-        for i, s in enumerate(seqs):
-            ids[i, : len(s)] = torch.tensor([ord(c) % 31 + 1 for c in s])
-            mask[i, : len(s)] = 1
-        return {"input_ids": ids, "attention_mask": mask}
+    unk_token = "<unk>"
+
+    def get_vocab(self):
+        return {"<pad>": 0, "<unk>": 1, **{c: i + 2 for i, c in enumerate("ACDEFGHIKLMNPQRSTVWYX")}}
 
 
 @pytest.fixture()
@@ -100,15 +97,17 @@ def test_batching_and_padding_do_not_change_predictions(repo):
 
 
 def test_windows_are_stitched_in_order(repo):
+    from pholdlib.modernprost.batching import chunk_sequence
+
     dev = torch.device("cpu")
     head = load_plddt_head(str(repo), model_dir=repo, device=dev)
     model = _Model().eval()
-    seq = SEQS["b"]  # 27 residues -> windows of 10, 10, 7
+    seq = SEQS["b"]  # 27 residues -> near-equal windows 9, 9, 9, as inference splits them
     windowed = predict_plddt(model, _Tokenizer(), head, {"b": seq}, dev, chunk_len=10)["b"]
-    slices = {str(i): seq[i : i + 10] for i in range(0, len(seq), 10)}
-    direct = predict_plddt(model, _Tokenizer(), head, slices, dev)
-    np.testing.assert_allclose(windowed, np.concatenate([direct[str(i)] for i in range(0, len(seq), 10)]),
-                               atol=1e-5)
+    slices = dict(chunk_sequence(seq, 10))
+    assert sorted(len(v) for v in slices.values()) == [9, 9, 9]
+    direct = predict_plddt(model, _Tokenizer(), head, {str(b): v for b, v in slices.items()}, dev)
+    np.testing.assert_allclose(windowed, np.concatenate([direct[str(b)] for b in sorted(slices)]), atol=1e-5)
 
 
 def test_hooks_are_removed(repo):
@@ -126,3 +125,39 @@ def test_head_must_match_backbone_width(repo):
     model.config.hidden_size = HIDDEN * 2
     with pytest.raises(ValueError, match="hidden size"):
         predict_plddt(model, _Tokenizer(), head, SEQS, dev)
+
+
+def test_segment_aware_head_matches_separate_proteins(repo):
+    # a packed row (two proteins back to back) with seg gives each protein its own padded result
+    from pholdlib.modernprost.plddt import ConvBlock
+
+    dev = torch.device("cpu")
+    head = load_plddt_head(str(repo), model_dir=repo, device=dev)
+    torch.manual_seed(1)
+    a, b = torch.randn(1, 7, HIDDEN), torch.randn(1, 5, HIDDEN)
+    sep = [head.predict(head.from_mixed(x, torch.ones(1, x.shape[1]))) for x in (a, b)]
+    row = torch.cat([a, b], dim=1)
+    seg = torch.tensor([[0] * 7 + [1] * 5])
+    packed = head.predict(head.from_mixed(row, torch.ones(1, 12), seg))
+    torch.testing.assert_close(packed, torch.cat(sep, dim=1), atol=1e-5, rtol=0)
+    leaky = head.predict(head.from_mixed(row, torch.ones(1, 12)))
+    assert not torch.allclose(leaky, packed, atol=1e-3)  # without seg the conv reads across the boundary
+
+
+def test_accumulated_mix_equals_layer_mix(repo):
+    from pholdlib.modernprost.plddt import LayerMixAccumulator
+
+    head = load_plddt_head(str(repo), model_dir=repo, device=torch.device("cpu"))
+    with torch.no_grad():
+        head.mix.weights.copy_(torch.tensor([0.3, -1.0, 2.0]))
+        head.mix.gamma.fill_(1.7)
+    model = _Model().eval()
+    ids = torch.randint(1, 31, (2, 6))
+    mask = torch.ones(2, 6, dtype=torch.long)
+    captured = []
+    handles = [l.register_forward_hook(lambda m, i, o: captured.append(o)) for l in model.encoder.layers]
+    with torch.no_grad(), LayerMixAccumulator(model, head) as acc:
+        model.encoder(ids, mask)
+    for h in handles:
+        h.remove()
+    torch.testing.assert_close(acc.mixed, head.mix(captured), atol=1e-5, rtol=0)
