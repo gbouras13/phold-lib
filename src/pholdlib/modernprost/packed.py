@@ -214,11 +214,11 @@ class PackedEncoder:
             h = h + attn.Wo(o)
             h = h + layer.mlp(layer.mlp_norm(h))
             if head is not None and self._mix_w[i] is not None:
-                term = self._mix_w[i] * F.layer_norm(h.float(), h.shape[-1:])
+                term = head.layer_term(h, self._mix_w[i])
                 mixed = term if mixed is None else mixed + term
         plddt = None
         if head is not None:
-            plddt = head.predict(head.from_mixed(mixed, self._ones, self.doc[None]))
+            plddt = head.predict(head.from_projected(mixed, self._ones, self.doc[None]))
         h = enc.final_norm(h)
         mult = m.mup_output_mult
         return m.head_3di(h) * mult, m.head_12st(h) * mult, h, plddt

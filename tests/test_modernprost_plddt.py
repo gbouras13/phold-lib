@@ -160,4 +160,7 @@ def test_accumulated_mix_equals_layer_mix(repo):
         model.encoder(ids, mask)
     for h in handles:
         h.remove()
-    torch.testing.assert_close(acc.mixed, head.mix(captured), atol=1e-5, rtol=0)
+    expected = torch.nn.functional.linear(head.mix(captured), head.proj.weight)
+    torch.testing.assert_close(acc.projected, expected, atol=1e-5, rtol=0)
+    torch.testing.assert_close(head.from_projected(acc.projected, mask), head.from_mixed(head.mix(captured), mask),
+                               atol=1e-5, rtol=0)

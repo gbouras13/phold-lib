@@ -17,8 +17,9 @@ The predicted pLDDT is used to mask low-confidence residues of the query DBs
 Normally the head runs inside the main inference pass:
 ``run_modernprost_inference(..., plddt_head=head)`` returns ``result.plddt``
 next to the 3Di / 12-state outputs, at the cost of the head alone. The layer
-mix is accumulated layer by layer (:class:`LayerMixAccumulator`), so no
-per-layer states are kept. In the packed engine, where several proteins share
+mix is accumulated layer by layer, already projected to the head's width
+(:meth:`PlddtHead.layer_term`), so no per-layer or hidden-size-wide state is
+kept. In the packed engine, where several proteins share
 one row, the convolutions take the per-token protein id (``seg``) and never
 read across a protein boundary, which gives exactly the per-protein result.
 :func:`predict_plddt` is a standalone pass for callers that already have
@@ -157,8 +158,24 @@ class PlddtHead(nn.Module):
 
     def from_mixed(self, mixed, attention_mask, seg=None):
         """Logits from the layer mix (``self.mix`` output). ``seg``: per-token protein id for packed rows."""
+        return self.from_projected(F.linear(mixed, self.proj.weight), attention_mask, seg)
+
+    def layer_term(self, h, w):
+        """One layer's share of the projected mix: ``w * layer_norm(h) @ proj.weight.T``, (B, L, d) float32.
+
+        ``proj`` is linear, so ``proj(sum_i w_i LN(h_i)) = sum_i layer_term(h_i, w_i) + proj.bias``:
+        accumulating these needs a d-wide buffer (128) instead of a hidden-size one (448 / 1536).
+        The layer norm is fp32; with a half-precision backbone the projection runs in its dtype (tensor
+        cores, fp32 accumulation) and the term is returned as fp32."""
+        x = F.layer_norm(h.float(), h.shape[-1:])
+        if h.dtype in (torch.float16, torch.bfloat16):
+            return w * F.linear(x.to(h.dtype), self.proj.weight.to(h.dtype)).float()
+        return w * F.linear(x, self.proj.weight)
+
+    def from_projected(self, projected, attention_mask, seg=None):
+        """Logits from the summed ``layer_term`` outputs (the projected mix without the bias)."""
         mask = attention_mask.unsqueeze(-1).float()
-        x = self.proj(mixed) * mask
+        x = (projected + self.proj.bias) * mask
         for block in self.blocks:
             x = block(x, mask, seg)
         for block in self.attn_blocks:
@@ -177,10 +194,11 @@ class PlddtHead(nn.Module):
 
 
 class LayerMixAccumulator:
-    """Forward hooks that build the head's layer mix while the backbone runs.
+    """Forward hooks that build the head's (projected) layer mix while the backbone runs.
 
-    Each hooked layer adds ``w_i * layer_norm(output)`` into one float32
-    buffer, so only one (B, L, H) tensor is kept instead of one per layer.
+    Each hooked layer adds its :meth:`PlddtHead.layer_term` into one float32
+    (B, L, d) buffer, ``projected``, so nothing hidden-size wide is kept
+    across layers. Finish with ``head.from_projected(acc.projected, mask)``.
     Use as a context manager around the forward; the hooks are removed on exit.
     """
 
@@ -190,7 +208,7 @@ class LayerMixAccumulator:
                              f"model has {model.config.hidden_size}")
         self.layers = model.encoder.layers
         self.head = head
-        self.mixed = None
+        self.projected = None
         self._handles = []
 
     def _hook(self, w):
@@ -198,13 +216,13 @@ class LayerMixAccumulator:
             h = output[0] if isinstance(output, tuple) else output
             if h.dim() == 4:  # hyper-connection streams (B, L, n, H) -> (B, L, H)
                 h = h.sum(dim=2)
-            term = w * F.layer_norm(h.float(), h.shape[-1:])
-            self.mixed = term if self.mixed is None else self.mixed + term
+            term = self.head.layer_term(h, w)
+            self.projected = term if self.projected is None else self.projected + term
 
         return fn
 
     def __enter__(self):
-        self.mixed = None
+        self.projected = None
         with torch.no_grad():
             weights = self.head.mix_weights()
         self._handles = [self.layers[i].register_forward_hook(self._hook(w)) for i, w in weights.items()]
@@ -296,7 +314,7 @@ def predict_plddt(
         mask = ids_t != 0  # <pad> is id 0
         with acc:
             model.encoder(ids_t, mask)
-        pred = head.predict(head.from_mixed(acc.mixed, mask)).float().cpu().numpy()
+        pred = head.predict(head.from_projected(acc.projected, mask)).float().cpu().numpy()
         for r, k in enumerate(batch):
             o, L = int(items.offsets[k]), int(items.lengths[k])
             out[o : o + L] = pred[r, :L]

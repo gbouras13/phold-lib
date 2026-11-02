@@ -904,8 +904,8 @@ class _PaddedRunner:
             pl = None
             if self.plddt_head is not None:
                 head = self.plddt_head
-                pl = head.predict(head.from_mixed(self.mix.mixed, mask)).reshape(B * Lp).index_select(0, sel_g)
-                self.mix.mixed = None
+                pl = head.predict(head.from_projected(self.mix.projected, mask)).reshape(B * Lp).index_select(0, sel_g)
+                self.mix.projected = None
         return l3, l12, hid, pl
 
 

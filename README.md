@@ -154,9 +154,10 @@ write_profile_foldseek_dbs(..., plddt=result.plddt, plddt_threshold=50)   # -pss
 generate_combined_foldseek_db(..., plddt=result.plddt, plddt_threshold=50) # classification: residue -> PACKED_X
 ```
 
-The head adds ~3% to inference (one 50M-PSSM CPU benchmark): the layer mix is accumulated while the encoder runs,
-and the packed engine runs the head inside its (compiled) forward with the convolutions confined to each protein,
-so the result equals running each protein on its own. `run_modernprost_inference_multi_gpu(..., plddt=True)` loads
+The head adds ~2-5% to inference (A100, compiled packed engine: 50M-PSSM fp32 +2.6% / fp16 +5.3%, base PSSM fp32
++2.3% / fp16 +1.6%; ~3% on CPU). Each layer's output is projected to the head's 128-wide input as the encoder runs, so
+the extra GPU memory is ~1 GiB per 64k-token packed row (base fp16), and the packed engine runs the head inside its
+compiled forward with the convolutions confined to each protein, so the result equals running each protein on its own. `run_modernprost_inference_multi_gpu(..., plddt=True)` loads
 the head on every device. Both maskings match `foldseek lowconfquery` byte for byte; the amino-acid DB / profile is
 never masked.
 
