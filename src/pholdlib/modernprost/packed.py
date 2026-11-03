@@ -34,6 +34,7 @@ from typing import Callable, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from pholdlib.modernprost.batching import TokenisedItems
 
@@ -107,6 +108,10 @@ class PackedEncoder:
             first time), ``"flex"`` compiles only the attention kernel.
         n_encoders: total encoders that will be built in this process (one per
             GPU), so the dynamo recompile limit can be raised to fit.
+        plddt_head: optional :class:`pholdlib.modernprost.plddt.PlddtHead`.
+            When given, the forward also returns per-token pLDDT: the layer mix
+            is accumulated as the layers run and the head's convolutions are
+            confined to each protein by the per-token protein id.
     """
 
     def __init__(
@@ -117,6 +122,7 @@ class PackedEncoder:
         block: int = DEFAULT_BLOCK,
         compile: str = "full",
         n_encoders: int = 1,
+        plddt_head=None,
     ):
         from torch.nn.attention.flex_attention import BlockMask, flex_attention
 
@@ -137,6 +143,13 @@ class PackedEncoder:
         self._from_kv_takes_lengths = "seq_lengths" in inspect.signature(BlockMask.from_kv_blocks).parameters
         # The checkpoint's own RoPE helper, so numerics match the padded path.
         self._apply_rope = sys.modules[type(model).__module__]._apply_rope
+        self.plddt_head = plddt_head
+        if plddt_head is not None:
+            with torch.no_grad():
+                weights = plddt_head.mix_weights()
+            # per-layer mix weight (gamma folded in); None for layers the head does not read
+            self._mix_w = [weights.get(i) for i in range(len(self.layer_is_full))]
+            self._ones = torch.ones(1, self.T, device=self.device)
 
         # Per-token protein id, read by the mask functions. It is overwritten
         # in place for every batch so the same mask functions, and the graphs
@@ -176,15 +189,18 @@ class PackedEncoder:
     def _forward(self, ids, pos, bm_full, bm_slide):
         """Packed equivalent of ``ModernProst3Di12StModel.forward``.
 
-        Returns ``(logits_3di, logits_12st, last_hidden_state)`` for the whole
-        row, shaped ``(1, T, 20)``, ``(1, T, 12)`` and ``(1, T, H)``.
+        Returns ``(logits_3di, logits_12st, last_hidden_state, plddt)`` for the
+        whole row, shaped ``(1, T, 20)``, ``(1, T, 12)``, ``(1, T, H)`` and
+        ``(1, T)`` (``plddt`` is None without a pLDDT head).
         """
         m = self.model
         enc = m.encoder
         h = enc.embeddings(ids)
         cos_f, sin_f = enc.rotary_emb(h, pos, "full")
         cos_s, sin_s = enc.rotary_emb(h, pos, "sliding")
-        for layer, is_full in zip(enc.layers, self.layer_is_full):
+        head = self.plddt_head
+        mixed = None
+        for i, (layer, is_full) in enumerate(zip(enc.layers, self.layer_is_full)):
             cos, sin, bm = (cos_f, sin_f, bm_full) if is_full else (cos_s, sin_s, bm_slide)
             attn = layer.attn
             x = layer.attn_norm(h)
@@ -197,9 +213,15 @@ class PackedEncoder:
             o = o.transpose(1, 2).contiguous().view(B, L, -1)
             h = h + attn.Wo(o)
             h = h + layer.mlp(layer.mlp_norm(h))
+            if head is not None and self._mix_w[i] is not None:
+                term = head.layer_term(h, self._mix_w[i])
+                mixed = term if mixed is None else mixed + term
+        plddt = None
+        if head is not None:
+            plddt = head.predict(head.from_projected(mixed, self._ones, self.doc[None]))
         h = enc.final_norm(h)
         mult = m.mup_output_mult
-        return m.head_3di(h) * mult, m.head_12st(h) * mult, h
+        return m.head_3di(h) * mult, m.head_12st(h) * mult, h, plddt
 
     # ── inputs ───────────────────────────────────────────────────────────────
 
@@ -258,8 +280,9 @@ class PackedEncoder:
     def run_batch(self, items: TokenisedItems, batch: np.ndarray, pin: bool = True):
         """Launch the forward for one packed row (asynchronous on GPU).
 
-        Returns ``(logits_3di, logits_12st, hidden, n_real)`` with the row's
-        real tokens first; slice ``[:n_real]`` before reading.
+        Returns ``(logits_3di, logits_12st, hidden, plddt, n_real)`` with the
+        row's real tokens first; slice ``[:n_real]`` before reading. ``plddt``
+        is None without a pLDDT head.
         """
         ids, pos, doc, start, end, n_real = self.host_inputs(items, batch)
         dev = self.device
@@ -282,5 +305,5 @@ class PackedEncoder:
         bm_slide = self._block_mask(torch.maximum(s_first, self._q_first - w),
                                     torch.minimum(e_last, self._q_last + w + 1), self.slide_mod)
         with torch.inference_mode():
-            l3, l12, hid = self.forward(ids_g, pos_g, bm_full, bm_slide)
-        return l3[0], l12[0], hid[0], n_real
+            l3, l12, hid, plddt = self.forward(ids_g, pos_g, bm_full, bm_slide)
+        return l3[0], l12[0], hid[0], None if plddt is None else plddt[0], n_real

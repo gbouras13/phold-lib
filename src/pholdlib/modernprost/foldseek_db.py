@@ -32,7 +32,7 @@ Ported from ``foldseek2_plm.utils.generate_foldseek_db``.
 import os
 import subprocess
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from loguru import logger
 
@@ -44,6 +44,10 @@ DBTYPE_GENERIC = 12
 # The structure/SS database type used for the combined 3Di+12st alphabet.
 # Matches foldseek2-plm's verified `generate_foldseek_db`.
 DBTYPE_SS_12ST = 2097152
+# Combined byte Foldseek reads as X in both alphabets (Alphabet12St::PACKED_X;
+# what ``foldseek lowconfquery`` writes at low-confidence residues). Valid
+# combined states are 0..239 (20 x 12).
+PACKED_X = 252
 
 THREEDI_INDEX: Dict[str, int] = {ch: i for i, ch in enumerate(THREEDI_ALPHABET)}
 SS12_INDEX: Dict[str, int] = {ch: i for i, ch in enumerate(SS12_ALPHABET)}
@@ -77,9 +81,9 @@ def encode_combined(seq_3di: str, seq_12st: str, seq_id: str = "") -> bytes:
     Raises:
         ValueError: on a length mismatch, or on a character outside either
             alphabet. In particular a masked ``X`` in the 3Di string is
-            rejected: the combined encoding has no 21st 3Di state, so masking
-            must be applied to the amino-acid FASTA instead (see
-            :mod:`pholdlib.modernprost.output`).
+            rejected: the combined encoding has no 21st 3Di state. To mask a
+            residue in a combined DB use ``PACKED_X`` (both letters X), e.g.
+            via ``generate_combined_foldseek_db(..., plddt_threshold=...)``.
     """
     if len(seq_3di) != len(seq_12st):
         raise ValueError(
@@ -112,6 +116,24 @@ def encode_combined(seq_3di: str, seq_12st: str, seq_id: str = "") -> bytes:
         out[j] = three * 12 + ss
 
     return bytes(out)
+
+
+def mask_combined(combined: bytes, plddt, threshold: float) -> bytes:
+    """Set combined bytes to ``PACKED_X`` where *plddt* < *threshold*."""
+    out = bytearray(combined)
+    for j, value in enumerate(plddt):
+        if value < threshold:
+            out[j] = PACKED_X
+    return bytes(out)
+
+
+def _plddt_for(plddt, seq_id: str, length: int):
+    values = None if plddt is None else plddt.get(seq_id)
+    if values is None or len(values) != length:
+        raise ValueError(
+            f"plddt_threshold is set but {seq_id!r} has no predicted pLDDT of length {length}."
+        )
+    return values
 
 
 def read_fasta(path: Path) -> Dict[str, str]:
@@ -152,6 +174,8 @@ def generate_combined_foldseek_db(
     db_name: str,
     tsv2db_runner: Tsv2DbRunner,
     keep_tsv: bool = False,
+    plddt: Optional[Dict[str, Sequence[float]]] = None,
+    plddt_threshold: Optional[float] = None,
 ) -> Path:
     """Build a Foldseek query DB with the combined 3Di + 12-state alphabet.
 
@@ -166,6 +190,13 @@ def generate_combined_foldseek_db(
         tsv2db_runner: Callable ``(in_tsv, out_db, dbtype)`` that runs
             ``foldseek tsv2db``. See :func:`subprocess_tsv2db_runner`.
         keep_tsv: Leave the intermediate TSVs on disk for debugging.
+        plddt: Optional ``{seq_id: per-residue predicted pLDDT}`` (see
+            :mod:`pholdlib.modernprost.plddt`), required with
+            *plddt_threshold*.
+        plddt_threshold: Set residues with predicted pLDDT below this value to
+            ``PACKED_X`` (X in both the 3Di and the 12-state alphabet), as
+            ``foldseek lowconfquery`` does. The amino-acid DB is unchanged.
+            ``None`` (default) masks nothing.
 
     Returns:
         The DB prefix path (``foldseek_db_path / db_name``).
@@ -243,7 +274,10 @@ def generate_combined_foldseek_db(
                     f"3di={len(d3)} 12st={len(s12)}"
                 )
 
-            combined_by_key[str(i)] = (rid, encode_combined(d3, s12, rid))
+            combined = encode_combined(d3, s12, rid)
+            if plddt_threshold is not None:
+                combined = mask_combined(combined, _plddt_for(plddt, rid, len(aa)), plddt_threshold)
+            combined_by_key[str(i)] = (rid, combined)
 
             f_aa.write(f"{i}\t{aa}\n")
             f_3di.write(f"{i}\t{d3}\n")

@@ -22,7 +22,14 @@ Three databases are produced for one query set:
 
 Each record is 25 bytes per residue: 20 profile scores (int8), then the query
 residue index, the consensus residue index, an Neff byte and two reserved
-zero bytes.
+zero bytes. In the database file every record is followed by a null byte, as
+Foldseek writes them: ``DBReader::getSeqLen`` reads ``(bytes - 1) / 25``
+residues, so a record without it loses its last residue.
+
+Optionally, the 3Di and 12-state profiles are masked at residues with low
+predicted pLDDT (see :mod:`pholdlib.modernprost.plddt`): their 20 scores are set
+to zero, exactly as Foldseek's ``lowconfquery`` does for lowercase query
+residues. The amino-acid profile is never masked.
 
 Ported from ``foldseek2_plm.utils.inference``.
 
@@ -216,6 +223,20 @@ def to_profile_record(
     return record.tobytes()
 
 
+def mask_profile_record(record: bytes, low_confidence: np.ndarray) -> bytes:
+    """Zero the 20 profile scores of the residues flagged in *low_confidence*.
+
+    Matches Foldseek ``lowconfquery`` on a profile DB: only the score bytes are
+    zeroed; the query, consensus and Neff bytes are kept.
+    """
+    low = np.asarray(low_confidence, dtype=bool)
+    rows = np.frombuffer(record, dtype=np.uint8).reshape(-1, PROFILE_RECORD_STRIDE).copy()
+    if len(low) != len(rows):
+        raise ValueError(f"mask has {len(low)} entries but the record has {len(rows)} residues")
+    rows[low, :20] = 0
+    return rows.tobytes()
+
+
 # ---------------------------------------------------------------------------
 # Amino-acid profile DB (BLOSUM62 rows for the query sequence)
 # ---------------------------------------------------------------------------
@@ -308,6 +329,8 @@ def write_profile_foldseek_dbs(
     db_name: str,
     source_db: Path,
     order: Optional[Sequence[str]] = None,
+    plddt: Optional[Dict[str, np.ndarray]] = None,
+    plddt_threshold: Optional[float] = None,
 ) -> Dict[str, Path]:
     """Write the 3Di, 12-state and amino-acid Foldseek profile databases.
 
@@ -326,6 +349,11 @@ def write_profile_foldseek_dbs(
         order: Optional explicit record order. Defaults to ``profiles_3di``'s
             insertion order. Records are index-sorted afterwards regardless, so
             this only affects data-file layout.
+        plddt: Optional ``{seq_id: ndarray (L,)}`` predicted pLDDT (0-100),
+            required with *plddt_threshold*.
+        plddt_threshold: Zero the 3Di and 12-state profile columns of residues
+            with predicted pLDDT below this value (the amino-acid profile is
+            not masked). ``None`` (default) masks nothing.
 
     Returns:
         ``{"profile_ss": ..., "profile_ss12": ..., "profile": ...}`` paths.
@@ -390,6 +418,21 @@ def write_profile_foldseek_dbs(
         buf_ss = to_profile_record(pssm_3di, consensus_3di, consensus_3di)
         buf_ss12 = to_profile_record(pssm_12st, consensus_12st, consensus_12st)
         buf_aa = aa_profile_record(aa_seq)
+
+        if plddt_threshold is not None:
+            seq_plddt = None if plddt is None else plddt.get(seq_id)
+            if seq_plddt is None or len(seq_plddt) != L:
+                raise ValueError(
+                    f"plddt_threshold is set but {seq_id!r} has no predicted pLDDT of length {L}."
+                )
+            low = np.asarray(seq_plddt) < plddt_threshold
+            buf_ss = mask_profile_record(buf_ss, low)
+            buf_ss12 = mask_profile_record(buf_ss12, low)
+
+        # Foldseek's record terminator (see the module docstring).
+        buf_ss += b"\0"
+        buf_ss12 += b"\0"
+        buf_aa += b"\0"
 
         parts_ss.append(buf_ss)
         index_ss.append(f"{key}\t{offset_ss}\t{len(buf_ss)}")

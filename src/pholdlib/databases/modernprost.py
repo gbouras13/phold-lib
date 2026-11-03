@@ -68,6 +68,11 @@ class ModernProstModel:
         approx_params: human-readable parameter count for log messages.
         download_mb: approximate on-disk size of ``model.safetensors``, used
             to warn before a multi-GB download starts.
+        revision: the Hugging Face commit this pholdlib version loads. Pinned
+            so a new upload to the repo's main never silently changes
+            predictions, and so a cache holding an older snapshot is detected
+            and refreshed (see :func:`check_modernprost_download`). The
+            pre-02/11/2026 weights are tagged ``jul26`` on the Hub.
     """
 
     hf_name: str
@@ -77,6 +82,7 @@ class ModernProstModel:
     num_attention_heads: int
     approx_params: str
     download_mb: int
+    revision: str
 
     @property
     def cache_subdir(self) -> str:
@@ -98,6 +104,7 @@ MODERNPROST_MODELS: Dict[str, ModernProstModel] = {
         num_attention_heads=24,
         approx_params="~1.0B",
         download_mb=4164,
+        revision="c49b53476d3c4fb268d47d942a22bbecda7eae90",  # 02/11/2026: + pLDDT head
     ),
     "modernprost-50M": ModernProstModel(
         hf_name="gbouras13/modernprost-50M",
@@ -107,6 +114,7 @@ MODERNPROST_MODELS: Dict[str, ModernProstModel] = {
         num_attention_heads=14,
         approx_params="~53M",
         download_mb=210,
+        revision="32294bde840ba0ce501426145061ad28b750e89f",  # 02/11/2026: + pLDDT head
     ),
     "modernprost-pssm": ModernProstModel(
         hf_name="gbouras13/modernprost-pssm",
@@ -116,6 +124,7 @@ MODERNPROST_MODELS: Dict[str, ModernProstModel] = {
         num_attention_heads=24,
         approx_params="~1.0B",
         download_mb=4164,
+        revision="ea24bcc04118a2ac35e873b6fdb34bcefdb75c6e",  # 02/11/2026: nng epoch-2 weights + pLDDT head
     ),
     "modernprost-50M-pssm": ModernProstModel(
         hf_name="gbouras13/modernprost-50M-pssm",
@@ -125,6 +134,7 @@ MODERNPROST_MODELS: Dict[str, ModernProstModel] = {
         num_attention_heads=14,
         approx_params="~53M",
         download_mb=210,
+        revision="9e4adaea52c48a3d4effcea2e5bb450da8ed7ca2",  # 02/11/2026: nng epoch-6 weights + pLDDT head
     ),
 }
 
@@ -234,33 +244,27 @@ def check_modernprost_download(
                     download = True
         return download
 
-    # No MD5 dictionary registered: fall back to checking that the resolved
+    # No MD5 dictionary registered: fall back to checking that the pinned
     # snapshot actually contains every file `from_pretrained` will need.
-    return not _snapshot_is_complete(cache_root)
+    return not _snapshot_is_complete(cache_root, spec.revision)
 
 
-def _snapshot_is_complete(cache_root: Path) -> bool:
-    """True when the HF cache at *cache_root* holds a complete snapshot.
+def _snapshot_is_complete(cache_root: Path, revision: str) -> bool:
+    """True when the HF cache at *cache_root* holds a complete snapshot of *revision*.
 
-    Resolves ``refs/main`` to a commit hash and checks every entry of
-    :data:`MODERNPROST_SNAPSHOT_FILES` exists and is non-empty under
-    ``snapshots/<hash>/``. Symlinked blobs are followed, so a snapshot whose
-    blob was truncated or removed reads as incomplete.
+    Checks every entry of :data:`MODERNPROST_SNAPSHOT_FILES` exists and is
+    non-empty under ``snapshots/<revision>/`` — the pinned commit, not whatever
+    ``refs/main`` pointed to when the cache was filled, so a cache holding an
+    older release reads as incomplete and is refreshed. Symlinked blobs are
+    followed, so a snapshot whose blob was truncated or removed reads as
+    incomplete.
     """
-    ref = cache_root / "refs" / "main"
-    if not ref.is_file():
-        logger.warning(f"No cached ModernProst snapshot found at {cache_root}")
-        return False
-
-    try:
-        commit = ref.read_text().strip()
-    except OSError as exc:
-        logger.warning(f"Could not read {ref}: {exc}")
-        return False
-
-    snapshot = cache_root / "snapshots" / commit
+    snapshot = cache_root / "snapshots" / revision
     if not snapshot.is_dir():
-        logger.warning(f"ModernProst snapshot directory {snapshot} does not exist.")
+        if (cache_root / "snapshots").is_dir():
+            logger.warning(f"Cached ModernProst model at {cache_root} is not the pinned revision {revision[:8]}.")
+        else:
+            logger.warning(f"No cached ModernProst snapshot found at {cache_root}")
         return False
 
     for filename in MODERNPROST_SNAPSHOT_FILES:

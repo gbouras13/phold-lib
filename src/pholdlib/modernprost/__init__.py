@@ -43,6 +43,9 @@ _EXPORTS = {
     "PACKED_MIN_RESIDUES": "inference",
     "packed_min_residues": "inference",
     "ENGINES": "inference",
+    # pLDDT head (imports torch)
+    "load_plddt_head": "plddt",
+    "predict_plddt": "plddt",
     # packed engine (imports torch)
     "PackedEncoder": "packed",
     "packed_engine_status": "packed",
@@ -75,11 +78,14 @@ _EXPORTS = {
     "sort_index_file": "foldseek_db",
     "subprocess_tsv2db_runner": "foldseek_db",
     "DBTYPE_SS_12ST": "foldseek_db",
+    "PACKED_X": "foldseek_db",
+    "mask_combined": "foldseek_db",
     # profile dbs (numpy only)
     "write_profile_foldseek_dbs": "profile_db",
     "compute_log_pssm_3di": "profile_db",
     "compute_log_pssm_12st": "profile_db",
     "to_profile_record": "profile_db",
+    "mask_profile_record": "profile_db",
     "aa_profile_record": "profile_db",
     "parse_profiles": "profile_db",
     "AA_ALPHABET": "profile_db",
