@@ -3,8 +3,8 @@ name: CI
 on:
   push:
     branches: [main]
+  # every PR, whatever its base branch (feature branches such as modernprost_12st take PRs too)
   pull_request:
-    branches: [main]
 
 jobs:
   test:
