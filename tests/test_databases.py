@@ -37,6 +37,7 @@ download_zenodo_prostT5 = _db.download_zenodo_prostT5
 PROSTT5_MD5_DICTIONARY = _db.PROSTT5_MD5_DICTIONARY
 _calc_md5 = _db._calc_md5
 _MODEL_SUBDIR = _db._MODEL_SUBDIR
+_safe_extractall = _db._safe_extractall
 
 
 # ===========================================================================
@@ -174,6 +175,110 @@ def _make_tarball(members: dict) -> bytes:
     return buf.getvalue()
 
 
+def _make_symlink_tarball(name: str, linkname: str) -> bytes:
+    """Build an in-memory .tar.gz holding a single symlink member."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        info = tarfile.TarInfo(name=name)
+        info.type = tarfile.SYMTYPE
+        info.linkname = linkname
+        tar.addfile(info)
+    return buf.getvalue()
+
+
+# ===========================================================================
+# _safe_extractall
+# ===========================================================================
+
+class TestSafeExtractall:
+    """Path-traversal protection shared by both Zenodo download helpers.
+
+    TarInfo records member names verbatim, so _make_tarball can build the
+    hostile archives a tampered-with or corrupted download would supply.
+    """
+
+    def _extract(self, tarball_bytes: bytes, dest: Path) -> None:
+        with tarfile.open(fileobj=io.BytesIO(tarball_bytes), mode="r:gz") as tar:
+            _safe_extractall(tar, dest)
+
+    def test_legitimate_tarball_still_extracts(self, tmp_path):
+        """Hardening must not break the normal HuggingFace-cache layout."""
+        tarball = _make_tarball(
+            {
+                "models--org--Model/refs/main": b"ref",
+                "models--org--Model/blobs/abc123": b"weights",
+            }
+        )
+        self._extract(tarball, tmp_path)
+
+        model = tmp_path / "models--org--Model"
+        assert (model / "refs" / "main").read_bytes() == b"ref"
+        assert (model / "blobs" / "abc123").read_bytes() == b"weights"
+
+    def test_parent_traversal_member_rejected(self, tmp_path):
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        tarball = _make_tarball({"../escaped.bin": b"pwned"})
+
+        with pytest.raises(tarfile.TarError):
+            self._extract(tarball, dest)
+
+        assert not (tmp_path / "escaped.bin").exists()
+        assert list(dest.rglob("*")) == []
+
+    def test_deep_traversal_member_rejected(self, tmp_path):
+        dest = tmp_path / "a" / "b" / "dest"
+        dest.mkdir(parents=True)
+        tarball = _make_tarball({"../../../escaped.bin": b"pwned"})
+
+        with pytest.raises(tarfile.TarError):
+            self._extract(tarball, dest)
+
+        assert not (tmp_path / "escaped.bin").exists()
+
+    def test_traversal_member_aborts_whole_extraction(self, tmp_path):
+        """A hostile member raises rather than being silently skipped."""
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        tarball = _make_tarball({"../escaped.bin": b"pwned", "legit.bin": b"fine"})
+
+        with pytest.raises(tarfile.TarError):
+            self._extract(tarball, dest)
+
+        assert not (tmp_path / "escaped.bin").exists()
+
+    def test_absolute_member_never_escapes_dest(self, tmp_path):
+        """An absolute member name must not write to that absolute location.
+
+        The two branches neutralise it differently — CPython's data filter
+        (3.12+) strips the leading separator and extracts inside dest, while
+        the manual branch (3.8-3.11) rejects the member outright — so this
+        asserts the invariant both uphold rather than one branch's mechanics.
+        """
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        victim = tmp_path / "victim.bin"
+        # An unhardened extractall would create exactly this path.
+        tarball = _make_tarball({str(victim): b"pwned"})
+
+        try:
+            self._extract(tarball, dest)
+        except tarfile.TarError:
+            pass  # 3.8-3.11 manual branch
+
+        assert not victim.exists()
+
+    def test_symlink_target_outside_dest_rejected(self, tmp_path):
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        tarball = _make_symlink_tarball("link.bin", "../../outside.bin")
+
+        with pytest.raises(tarfile.TarError):
+            self._extract(tarball, dest)
+
+        assert not (dest / "link.bin").exists()
+
+
 class TestDownloadZenodoProstT5:
     def _mock_download(self, mod, tarball_bytes, dest_attr="_download_requests"):
         """Patch _download_requests to write tarball_bytes to its dest argument."""
@@ -234,3 +339,26 @@ class TestDownloadZenodoProstT5:
                 )
         # extraction still happened despite MD5 mismatch
         assert (tmp_path / "file.bin").exists()
+
+    def test_traversal_tarball_rejected(self, tmp_path):
+        """A hostile tarball raises instead of writing outside model_dir."""
+        model_dir = tmp_path / "models"
+        model_dir.mkdir()
+        tarball_bytes = _make_tarball({"../escaped.bin": b"pwned"})
+        backup_md5 = hashlib.md5(tarball_bytes).hexdigest()
+
+        with self._mock_download(_db, tarball_bytes):
+            with pytest.raises(tarfile.TarError):
+                download_zenodo_prostT5(
+                    model_dir=model_dir,
+                    logdir=str(tmp_path / "logdir"),
+                    threads=1,
+                    backup_url="http://example.com/model.tar.gz",
+                    backup_md5=backup_md5,
+                    backup_tarball="model.tar.gz",
+                )
+
+        assert not (tmp_path / "escaped.bin").exists()
+        # TarError is not swallowed by the `except OSError`, so the offending
+        # tarball survives the unlink() at the end for inspection.
+        assert (model_dir / "model.tar.gz").exists()

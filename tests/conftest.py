@@ -89,6 +89,15 @@ def pytest_addoption(parser):
         default=False,
         help="Run integration tests (downloads ProstT5 ~1.6 GB if not cached).",
     )
+    parser.addoption(
+        "--run_modernprost_integration",
+        action="store_true",
+        default=False,
+        help=(
+            "Run ModernProst engine integration tests (downloads modernprost-50M "
+            "and modernprost-50M-pssm, ~210 MB each, into --model_dir if not cached)."
+        ),
+    )
 
 
 @pytest.fixture(scope="session")
@@ -116,3 +125,8 @@ def threads(pytestconfig):
 @pytest.fixture(scope="session")
 def run_integration(pytestconfig):
     return pytestconfig.getoption("run_integration")
+
+
+@pytest.fixture(scope="session")
+def run_modernprost_integration(pytestconfig):
+    return pytestconfig.getoption("run_modernprost_integration")
