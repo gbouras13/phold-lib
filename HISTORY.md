@@ -1,6 +1,6 @@
 # History
 
-0.3.0 (unreleased)
+0.3.0
 ------------------
 * Adds ModernProst support (`pholdlib.modernprost`). ModernProst maps an amino-acid sequence directly to Foldseek's 3Di alphabet and a 12-state alphabet in one forward pass, with no ProstT5 encoder or CNN head. Four checkpoints: `modernprost-base` and `modernprost-50M` (argmax 3Di/12-state), and `modernprost-pssm` and `modernprost-50M-pssm` (per-residue profiles)
 * Builds Foldseek query databases from ModernProst outputs: combined 3Di + 12-state databases (search with `--ss-12st 1`), and 3Di / 12-state / amino-acid profile databases for the `-pssm` models
